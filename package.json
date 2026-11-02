@@ -1,6 +1,6 @@
 {
   "name": "@cr903/opencode-swarm",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Swarm multi-session orchestration for OpenCode: planner splits tasks, dev implements, tester verifies independently, reviewer audits semantics. Atomic queue, sandboxed verify gates, timeline audit, TUI board.",
   "type": "module",
   "exports": {
@@ -29,7 +29,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/CR903/opencode-swarm.git"
+    "url": "git+https://github.com/CR903/opencode-swarm.git"
   },
   "homepage": "https://github.com/CR903/opencode-swarm#readme",
   "bugs": {
