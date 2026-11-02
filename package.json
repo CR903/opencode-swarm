@@ -1,0 +1,50 @@
+{
+  "name": "@cr903/opencode-swarm",
+  "version": "1.0.0",
+  "description": "Swarm multi-session orchestration for OpenCode: planner splits tasks, dev implements, tester verifies independently, reviewer audits semantics. Atomic queue, sandboxed verify gates, timeline audit, TUI board.",
+  "type": "module",
+  "exports": {
+    ".": "./plugins/swarm.js",
+    "./tui": "./tui/swarm-board.tsx"
+  },
+  "files": [
+    "plugins/swarm.js",
+    "tui/swarm-board.tsx",
+    "lib/",
+    "agents/",
+    "skills/",
+    "review/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "swarm",
+    "multi-agent",
+    "code-review",
+    "orchestration"
+  ],
+  "author": "CR903",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CR903/opencode-swarm.git"
+  },
+  "homepage": "https://github.com/CR903/opencode-swarm#readme",
+  "bugs": {
+    "url": "https://github.com/CR903/opencode-swarm/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/swarm.test.mjs tests/swarm.e2e.test.mjs tests/swarm-board-data.test.mjs"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.2.0",
+    "solid-js": "^1.9.12",
+    "@opentui/solid": "^0.7.0",
+    "@opentui/core": "^0.7.0"
+  }
+}
