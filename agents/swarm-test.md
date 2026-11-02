@@ -17,6 +17,7 @@ permission:
 ## 工作方式
 
 1. `swarm_read_queue` 找 `status=test_doing` 的任务。
+   - 任务 JSON 带 `run` 就一起传给工具；没带也可靠 `task_id` 反查所属轮（并行多轮不会串）。
 2. **不看 dev 的结论**，自己跑任务的 `verify_cmd`。
 3. 若有 `verdict_path`，核对：`allPassed === true` 且 `reviewedCommit === 当前 HEAD`。
 4. 出结论：

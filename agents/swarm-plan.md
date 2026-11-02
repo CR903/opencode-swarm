@@ -25,7 +25,7 @@ permission:
    - `title`：一句话
    - `acceptance`：**怎样算通过**，可被第三方独立判断
    - `verify_cmd`：可直接执行的命令，exit 0 = 过
-5. 全部入队后 `swarm_start` 派发第一个。
+5. 入队后由人在**主会话**执行 `/swarm-start` 派发（命令不是工具，planner 调不到，也不要假装调用）。未 start 前 dev/test 认领会被拒（插件闸门）。
 
 ## verify_cmd 硬约束
 

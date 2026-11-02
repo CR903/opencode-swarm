@@ -22,7 +22,7 @@ import { join } from 'node:path';
 
 import { loadQueue, saveQueueAtomic, casTransition, enqueueTask, transitionTask, withLock, invalidate, appendTimeline } from '../lib/swarm-store.js';
 import { TRANSITIONS, STATUSES, can, allowedFrom, checkTransition } from '../lib/swarm-fsm.js';
-import { sanitizeRunId, resolveRun, writeCurrentRunId, listRuns, migrateLegacy, timelinePathFor, rebuildQueueFromTimeline, readTimeline, readMeta, writeMeta, ensureRunMeta, normalizeExecutor, EXECUTORS, validateFindings, validateReviewVerdict, mergeFindings, findingKey, excludedFindingIds, excludedIntersection, resolveReviewDoc, FINDING_SEVERITIES, REVIEW_VERDICTS, REVIEW_MAX_ROUNDS, deriveRunIdFromName, isRunDirNonEmpty, resolveUniqueRunId, runQueueHasTasks } from '../lib/swarm-run.js';
+import { sanitizeRunId, resolveRun, writeCurrentRunId, listRuns, migrateLegacy, timelinePathFor, rebuildQueueFromTimeline, readTimeline, readMeta, writeMeta, ensureRunMeta, normalizeExecutor, EXECUTORS, validateFindings, validateReviewVerdict, mergeFindings, findingKey, excludedFindingIds, excludedIntersection, resolveReviewDoc, FINDING_SEVERITIES, REVIEW_VERDICTS, REVIEW_MAX_ROUNDS, deriveRunIdFromName, isRunDirNonEmpty, resolveUniqueRunId, runQueueHasTasks, sessionRunIndex, runIdForSession, runIdForTask } from '../lib/swarm-run.js';
 import { parseCommand, runVerify, DEFAULT_ALLOWLIST } from '../lib/swarm-exec.js';
 import { eventId, createChannel } from '../lib/swarm-events.js';
 import { createFileBus, eventId as busEventId } from '../lib/swarm-filebus.js';
@@ -541,6 +541,57 @@ describe('run isolation', () => {
   test('listRuns 列出多轮', () => {
     const runs = listRuns(dir).map((r) => r.runId);
     assert.ok(runs.includes('A') && runs.includes('B'), `应含 A/B，实际 ${runs.join(',')}`);
+  });
+});
+
+describe('会话/任务 → run 解析（10-31 并行两轮串轮修复）', () => {
+  const mkRun = (root, id, round, tasks = []) => {
+    const d = join(root, '.swarm', 'runs', id);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'round.json'), JSON.stringify(round), 'utf8');
+    writeFileSync(join(d, 'meta.json'), JSON.stringify({ runId: id, name: id }), 'utf8');
+    writeFileSync(join(d, 'queue.jsonl'),
+      tasks.map((t) => JSON.stringify({ ...emptyTask(), ...t })).join('\n') + (tasks.length ? '\n' : ''), 'utf8');
+    return d;
+  };
+
+  test('优先级：显式 run > 任务归属 > 会话绑定 > current > default', () => {
+    const d = mkdtempSync(join(tmpdir(), 'swarm-bind-'));
+    try {
+      mkRun(d, 'A', { name: 'A', sessions: { plan: 'sid-plan-a' }, members: { 'sid-host-a': { role: 'host' } } }, [{ id: 'TA' }]);
+      mkRun(d, 'B', { name: 'B', sessions: { dev: 'sid-dev-b' }, members: { 'sid-sub-b': { role: 'dev' } } }, [{ id: 'TB' }]);
+      writeCurrentRunId(d, 'A');
+      // 会话绑定压过全局 current（串轮事故根因）
+      assert.equal(resolveRun(d, { sessionID: 'sid-dev-b' }).runId, 'B');
+      assert.equal(resolveRun(d, { sessionID: 'sid-host-a' }).runId, 'A');
+      assert.equal(resolveRun(d, { sessionID: 'sid-sub-b' }).runId, 'B', 'members（子代理）同样可反查');
+      // 未绑定会话仍回 current（老行为零变）
+      assert.equal(resolveRun(d, { sessionID: 'unknown' }).runId, 'A');
+      // 任务归属：子代理没带 run 也能落对轮
+      assert.equal(resolveRun(d, { taskId: 'TB' }).runId, 'B');
+      assert.equal(resolveRun(d, { taskId: 'NOPE' }).runId, 'A');
+      // 显式 run 永远最高
+      assert.equal(resolveRun(d, { run: 'A', taskId: 'TB' }).runId, 'A');
+      assert.equal(runIdForSession(d, 'sid-dev-b'), 'B');
+      assert.equal(runIdForTask(d, 'TA'), 'A');
+      assert.deepEqual(Object.keys(sessionRunIndex(d)).sort(), ['sid-dev-b', 'sid-host-a', 'sid-plan-a', 'sid-sub-b']);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  test('writeRound：members 默认合并，replaceMembers 整体替换且不动 sessions', () => {
+    const d = mkdtempSync(join(tmpdir(), 'swarm-mem-'));
+    try {
+      writeRound(d, { name: 'n', sessions: { plan: 'p1' }, members: { s1: { role: 'host' } } });
+      writeRound(d, { members: { s2: { role: 'dev' } } });
+      assert.deepEqual(readRound(d).members, { s1: { role: 'host' }, s2: { role: 'dev' } }, '默认合并');
+      writeRound(d, { members: { s3: { role: 'host' } } }, { replaceMembers: true });
+      assert.deepEqual(readRound(d).members, { s3: { role: 'host' } }, '整体替换');
+      assert.deepEqual(readRound(d).sessions, { plan: 'p1' }, '替换 members 不得动 sessions');
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
   });
 });
 

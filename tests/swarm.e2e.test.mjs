@@ -28,7 +28,14 @@ let sessions;
 let hooks = {};
 let promptHook;
 
-const run = async (name, input) => (await tools.get(name).execute(input)).content;
+/**
+ * e2e 默认绕过 P1 start 闸门：这些用例测的是门禁/FSM/评审等其它语义，
+ * 统一带 force:true 认领；闸门本身由「start 闸门」用例直调 tools.execute 验证。
+ */
+const withForce = (name, input) => (name === 'swarm_claim' || name === 'swarm_next')
+  ? { force: true, ...input }
+  : input;
+const run = async (name, input) => (await tools.get(name).execute(withForce(name, input))).content;
 const cmd = async (name, text = '', sessionID = 's1') => {
   await cmds.get(name).execute({ sessionID, prompt: { text } });
   return prompts.at(-1);
@@ -354,13 +361,14 @@ describe('事件耐久性（FileBus 本地审计）', () => {
 });
 
 describe('/swarm-up', () => {
-  test('按角色建会话并选模型（显式 sessions）', async () => {
+  test('默认主会话即 planner：只建 dev/test，plan 指向本会话', async () => {
     const out = await cmd('swarm-up',
       '--planner-model opencode-go/deepseek-v4.1-flash --dev-model opencode-go/muse-spark-1.3-contributor --tester-model opencode-go/deepseek-v4.1-flash --executor sessions');
     assert.match(out, /## swarm-up/);
-    assert.match(out, /plan .*opencode-go\/deepseek-v4\.1-flash/);
+    assert.match(out, /plan ✓ `s1` · 本会话（主会话即 planner/);
     assert.match(out, /dev .*opencode-go\/muse-spark-1\.3-contributor/);
     assert.match(out, /test /);
+    assert.match(out, /未 start 前 dev\/test 认领会被拒/);
   });
 
   test('模型不存在 → 一个会话都不建，并给出候选', async () => {
@@ -393,17 +401,28 @@ describe('/swarm-up', () => {
 
   test('台账记录会话，会话带上对应 agent', async () => {
     const r = roundState();
-    assert.equal(r.sessions.plan, 'sess-1');
-    assert.equal(sessions.get('sess-1').agent, 'swarm-plan');
-    assert.equal(sessions.get('sess-2').agent, 'swarm-dev');
+    assert.equal(r.sessions.plan, 's1', '默认主会话即 planner');
+    assert.equal(sessions.get(r.sessions.dev).agent, 'swarm-dev');
+    assert.equal(sessions.get(r.sessions.test).agent, 'swarm-test');
+    assert.ok(r.members && r.members['s1'], 'members 应登记主会话（footor/sidebar 跟随用）');
   });
 
-  test('--name 直接给三个会话起名（显式 sessions）', async () => {
+  test('--name 直接给会话起名（显式 sessions）', async () => {
     const out = await cmd('swarm-up', '--run default --name 待办角标刷新 --dev-model opencode-go/deepseek-v4.1-flash --executor sessions');
     assert.match(out, /待办角标刷新/);
-    assert.equal(sessions.get('sess-4').title, '待办角标刷新');
-    assert.equal(sessions.get('sess-5').title, '待办角标刷新 · dev');
-    assert.equal(sessions.get('sess-6').title, '待办角标刷新 · test');
+    const r = roundState();
+    assert.equal(sessions.get('s1').title, '待办角标刷新', '主会话（planner）用纯需求名');
+    assert.equal(sessions.get(r.sessions.dev).title, '待办角标刷新 · dev');
+    assert.equal(sessions.get(r.sessions.test).title, '待办角标刷新 · test');
+  });
+
+  test('--plan-session new 保留旧行为：另建 plan 会话', async () => {
+    const out = await cmd('swarm-up', '--run plannew --plan_session new --planner-model opencode-go/deepseek-v4.1-flash --executor sessions', 'host-pn');
+    assert.match(out, /plan .*opencode-go\/deepseek-v4\.1-flash/);
+    const r = JSON.parse(readFileSync(join(dir, '.swarm/runs/plannew/round.json'), 'utf8'));
+    assert.notEqual(r.sessions.plan, 'host-pn', '显式 new 时 plan 应为独立会话');
+    assert.equal(sessions.get(r.sessions.plan).agent, 'swarm-plan');
+    await cmd('swarm-switch', '--run default'); // 复原 current
   });
 });
 
@@ -413,8 +432,9 @@ describe('需求命名（会话标题跟着需求走）', () => {
     await promptHook(ev);
     await new Promise((r) => setTimeout(r, 20)); // nameRound 是 fire-and-forget
     assert.match(sessions.get('main-sess')?.title, /^待办页面审批完成后导航栏角标立即刷新，不要出现/);
-    assert.match(sessions.get('sess-4').title, /^待办页面审批完成后导航栏角标立即刷新，不要出现/);
-    assert.match(sessions.get('sess-5').title, /· dev$/);
+    const r = roundState();
+    assert.ok(sessions.get(r.sessions.plan).title.startsWith('待办页面审批完成后导航栏角标立即刷新'));
+    assert.match(sessions.get(r.sessions.dev).title, /· dev$/);
     assert.match(roundState().name, /待办页面审批完成后导航栏角标/);
   });
 
@@ -423,12 +443,13 @@ describe('需求命名（会话标题跟着需求走）', () => {
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(sessions.get('user-main')?.title, '借用单用途必填');
     assert.match(out, /本轮：\*\*借用单用途必填\*\*/);
-    assert.match(sessions.get('sess-5').title, /借用单用途必填 · dev/);
+    const r = roundState();
+    assert.match(sessions.get(r.sessions.dev).title, /借用单用途必填 · dev/);
   });
 
   test('title hook 用需求名覆盖自动标题', async () => {
     assert.equal(typeof hooks.title, 'function');
-    const ev = { sessionID: 'sess-5' };
+    const ev = { sessionID: roundState().sessions.dev };
     hooks.title(ev);
     assert.equal(ev.result.title, `${roundState().name} · dev`);
   });
@@ -445,7 +466,8 @@ describe('派发可见性（不再「不知道有没有跑」；显式 sessions 
     assert.match(out, /指令已投递/);
     assert.match(out, /未验证跑起来/);
     assert.doesNotMatch(out, /开始执行/);
-    const woke = promptCalls.slice(before).find((c) => c.sessionID === 'sess-5');
+    const devSid = roundState().sessions.dev;
+    const woke = promptCalls.slice(before).find((c) => c.sessionID === devSid);
     assert.ok(woke, '应给 dev 会话发一条 #dev 指令');
     assert.match(woke.text, /你是 dev/);
     assert.match(woke.text, /W9-T1/);
@@ -454,7 +476,8 @@ describe('派发可见性（不再「不知道有没有跑」；显式 sessions 
   test('swarm_done 通过后唤醒 test 会话', async () => {
     const before = promptCalls.length;
     await run('swarm_done', { task_id: 'W9-T1', summary: '唤醒演练' });
-    const woke = promptCalls.slice(before).find((c) => c.sessionID === 'sess-6');
+    const testSid = roundState().sessions.test;
+    const woke = promptCalls.slice(before).find((c) => c.sessionID === testSid);
     assert.ok(woke, '应给 test 会话发一条 #test 指令');
     assert.match(woke.text, /你是 test/);
   });
@@ -491,7 +514,7 @@ describe('run 隔离：双轮并行（不传 queue → 按 run 切分）', () =>
   let sessions2;
   let hooks2 = {};
 
-  const run2 = async (name, input) => (await tools2.get(name).execute(input)).content;
+  const run2 = async (name, input) => (await tools2.get(name).execute(withForce(name, input))).content;
   const cmd2 = async (name, text = '', sessionID = 's1') => {
     await cmds2.get(name).execute({ sessionID, prompt: { text } });
     return prompts2.at(-1);
@@ -631,7 +654,7 @@ describe('up 新轮隔离（无 --run 派生，不串旧轮）', () => {
   let cmds3;
   let sessions3;
 
-  const run3 = async (name, input) => (await tools3.get(name).execute(input)).content;
+  const run3 = async (name, input) => (await tools3.get(name).execute(withForce(name, input))).content;
   const cmd3 = async (name, text = '', sessionID = 's1') => {
     await cmds3.get(name).execute({ sessionID, prompt: { text } });
     return prompts3.at(-1);
@@ -687,10 +710,11 @@ describe('up 新轮隔离（无 --run 派生，不串旧轮）', () => {
       snap[f] = bytes3(join(dir3, '.swarm/runs/default', f));
     }
     const oldIds = Object.values(JSON.parse(snap['round.json']).sessions ?? {});
-    assert.ok(oldIds.length >= 3, `旧轮应有 plan/dev/test 会话，实际 ${oldIds.length}`);
+    assert.ok(oldIds.length >= 2, `旧轮应有 plan(=host)/dev/test 登记，实际 ${oldIds.length}`);
 
-    // 2. 新轮：无 --run + 有 --name（派生 runId，不碰 default）
-    const out = await cmd3('swarm-up', '--executor sessions --name 库房列表库存显示');
+    // 2. 新轮：无 --run + 有 --name（派生 runId，不碰 default；用另一个主会话，
+    //    同一会话开新轮会按设计把 host 从旧轮摘走，见「会话换轮」用例）
+    const out = await cmd3('swarm-up', '--executor sessions --name 库房列表库存显示', 's1-new');
     assert.match(out, /## swarm-up/);
     assert.doesNotMatch(out, /拒绝复用/);
 
@@ -1009,7 +1033,7 @@ describe('R2 开关（独立实例，gates:{lint:true}，无 Makefile）', () =>
       tool: { transform: async (fn) => fn({ add: (d) => toolsR2.set(d.name, d) }) },
     };
     await plugin.setup(ctxR2);
-    runR2 = async (name, input) => (await toolsR2.get(name).execute(input)).content;
+    runR2 = async (name, input) => (await toolsR2.get(name).execute(withForce(name, input))).content;
     const qp = join(dirR2, '.swarm', 'runs', 'default', 'queue.jsonl');
     runR2.qp = qp;
   });
@@ -1084,7 +1108,7 @@ describe('R3 base 竞态（独立实例，mock git）', () => {
       tool: { transform: async (fn) => fn({ add: (d) => toolsR3.set(d.name, d) }) },
     };
     await plugin.setup(ctxR3);
-    runR3 = async (name, input) => (await toolsR3.get(name).execute(input)).content;
+    runR3 = async (name, input) => (await toolsR3.get(name).execute(withForce(name, input))).content;
   });
 
   after(() => { rmSync(dirR3, { recursive: true, force: true }); rmSync(mockState, { recursive: true, force: true }); });
@@ -1588,7 +1612,7 @@ describe('start 失败零落盘（校验前置）', () => {
   let sessionsC;
   let seqC = 0;
 
-  const runC = async (name, input) => (await toolsC.get(name).execute(input)).content;
+  const runC = async (name, input) => (await toolsC.get(name).execute(withForce(name, input))).content;
   const cmdC = async (name, text = '', sessionID = 's1') => {
     await cmdsC.get(name).execute({ sessionID, prompt: { text } });
     return promptsC.at(-1);
@@ -1770,7 +1794,7 @@ describe('模型注册表不可用时 fail-open（放行不卡编排）', () => 
       tool: { transform: async (fn) => fn({ add: (d) => toolsF.set(d.name, d) }) },
     };
     await plugin.setup(ctxF);
-    runF = async (name, input) => (await toolsF.get(name).execute(input)).content;
+    runF = async (name, input) => (await toolsF.get(name).execute(withForce(name, input))).content;
   });
 
   after(() => { rmSync(dirF, { recursive: true, force: true }); });
@@ -1822,7 +1846,7 @@ describe('/swarm-drained 只读判活（三态与 dispatchNext 同调）', () =>
       tool: { transform: async (fn) => fn({ add: (d) => toolsD.set(d.name, d) }) },
     };
     await plugin.setup(ctxD);
-    runD = async (name, input) => (await toolsD.get(name).execute(input)).content;
+    runD = async (name, input) => (await toolsD.get(name).execute(withForce(name, input))).content;
     cmdD = async (name, text = '', sessionID = 's1') => {
       await cmdsD.get(name).execute({ sessionID, prompt: { text } });
       return promptsD.at(-1);
@@ -2045,7 +2069,7 @@ describe('/swarm-eval 只读导出（幂等 + 只读）+ 门禁 warning 可见',
       tool: { transform: async (fn) => fn({ add: (d) => toolsE.set(d.name, d) }) },
     };
     await plugin.setup(ctxE);
-    runE = async (name, input) => (await toolsE.get(name).execute(input)).content;
+    runE = async (name, input) => (await toolsE.get(name).execute(withForce(name, input))).content;
     cmdE = async (name, text = '', sessionID = 's1') => {
       await cmdsE.get(name).execute({ sessionID, prompt: { text } });
       return promptsE.at(-1);
@@ -2176,7 +2200,7 @@ describe('/swarm-clean 归档 + current 善后', () => {
       tool: { transform: async (fn) => fn({ add: (d) => toolsL.set(d.name, d) }) },
     };
     await plugin.setup(ctxL);
-    runL = async (name, input) => (await toolsL.get(name).execute(input)).content;
+    runL = async (name, input) => (await toolsL.get(name).execute(withForce(name, input))).content;
     cmdL = async (name, text = '', sessionID = 's1') => {
       await cmdsL.get(name).execute({ sessionID, prompt: { text } });
       return promptsL.at(-1);
@@ -2468,7 +2492,7 @@ describe('无参 /swarm-up 提问式开场卡（零会话零落盘零队列读�
   });
 
   test('high-risk 未批直抢：claim 放行但带软提示（指去补批），不静默', async () => {
-    const tRun = async (name, input) => (await toolsUMap.get(name).execute(input)).content;
+    const tRun = async (name, input) => (await toolsUMap.get(name).execute(withForce(name, input))).content;
     const p = await tRun('swarm_plan', { tasks: [{ id: 'NC-T1', wave: 'NC', title: '高风险直抢', acceptance: '人工复核通过', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', paths: ['src/pay.ts'] }], run: 'NAMECLAIM' });
     assert.match(p, /NC-T1: queued/);
     const c = await tRun('swarm_claim', { task_id: 'NC-T1', run: 'NAMECLAIM' });
@@ -2487,35 +2511,36 @@ describe('无参 /swarm-up 提问式开场卡（零会话零落盘零队列读�
     assert.match(out, /未知角色/);
   });
 
-  test('默认 hybrid：有 flag 建 plan+dev（test 走子代理，不建会话）', async () => {
+  test('默认 hybrid：有 flag 建 dev（plan=本会话、test 走子代理）', async () => {
     const nBefore = createCount;
     const out = await cmdU('swarm-up', '--name 开场卡回归 --dev-model opencode-go/deepseek-v4.1-flash');
     assert.match(out, /## swarm-up/);
-    assert.match(out, /hybrid：plan\+dev 建会话/);
+    assert.match(out, /hybrid：plan=本会话 \+ dev/);
     assert.match(out, /跳过（hybrid 模式/);
     assert.match(out, /开场卡回归/);
+    assert.match(out, /plan ✓ .*本会话（主会话即 planner/);
     assert.doesNotMatch(out, /开轮前先问三件事/);
-    assert.equal(createCount - nBefore, 2, '默认 hybrid 建 plan+dev 两个会话');
+    assert.equal(createCount - nBefore, 1, '默认 hybrid：plan 用主会话，只建 dev 一个会话');
   });
 
-  test('显式 --executor subagents 仅建 plan（老行为零变）', async () => {
+  test('显式 --executor subagents 不建会话（plan=主会话，dev/test 走子代理）', async () => {
     const nBefore = createCount;
     const out = await cmdU('swarm-up', '--name 子代理回退 --dev-model opencode-go/deepseek-v4.1-flash --executor subagents');
     assert.match(out, /## swarm-up/);
-    assert.match(out, /仅 plan 建会话/);
+    assert.match(out, /subagents：plan=本会话/);
     assert.match(out, /跳过（subagent 模式/);
     assert.doesNotMatch(out, /开轮前先问三件事/);
-    assert.equal(createCount - nBefore, 1, '显式 subagents 仅建 plan 一个会话');
+    assert.equal(createCount - nBefore, 0, '显式 subagents：plan 用主会话，dev/test 不建会话');
   });
 
-  test('显式 --executor sessions 照建三个会话（回退通道，老行为）', async () => {
+  test('显式 --executor sessions 照建 dev/test 两个会话（plan=主会话）', async () => {
     const nBefore = createCount;
     const out = await cmdU('swarm-up', '--name 回退通道 --dev-model opencode-go/deepseek-v4.1-flash --executor sessions');
     assert.match(out, /## swarm-up/);
     assert.match(out, /回退通道/);
     assert.doesNotMatch(out, /开轮前先问三件事/);
     assert.doesNotMatch(out, /仅 plan 建会话/);
-    assert.equal(createCount - nBefore, 3, '显式 sessions 建 plan/dev/test 三个会话');
+    assert.equal(createCount - nBefore, 2, '显式 sessions：plan 用主会话，建 dev/test 两个会话');
   });
 });
 
@@ -2528,7 +2553,7 @@ describe('wake 预检 + 投递口径 + 无人接单（PRD 10-30 swarm-wake-verif
   let sessionsW;
   let seqW;
 
-  const runW = async (name, input) => (await toolsW.get(name).execute(input)).content;
+  const runW = async (name, input) => (await toolsW.get(name).execute(withForce(name, input))).content;
   const cmdW = async (name, text = '', sessionID = 's1') => {
     await cmdsW.get(name).execute({ sessionID, prompt: { text } });
     return promptsW.at(-1);
@@ -2659,7 +2684,7 @@ describe('HALT-only 主会话推送（10-30-swarm-halt-push）', () => {
   let sessionsH;
   let seqH;
 
-  const runH = async (name, input) => (await toolsH.get(name).execute(input)).content;
+  const runH = async (name, input) => (await toolsH.get(name).execute(withForce(name, input))).content;
   const cmdH = async (name, text = '', sessionID = 's1') => {
     await cmdsH.get(name).execute({ sessionID, prompt: { text } });
     return promptsH.at(-1);
@@ -2994,7 +3019,7 @@ describe('orchestrate tool 版（halt/revert/config，与命令共用函数）',
   let promptsO;
   let promptCallsO;
 
-  const runO = async (name, input) => (await toolsO.get(name).execute(input)).content;
+  const runO = async (name, input) => (await toolsO.get(name).execute(withForce(name, input))).content;
   const cmdO = async (name, text = '', sessionID = 's1') => {
     await cmdsO.get(name).execute({ sessionID, prompt: { text } });
     return promptsO.at(-1);
@@ -3130,7 +3155,7 @@ describe('secret 门禁（离线四例，真实 git commit + worktree）', () =>
       tool: { transform: async (fn) => fn({ add: (d) => toolsS.set(d.name, d) }) },
     };
     await plugin.setup(ctxS);
-    runS = async (name, input) => (await toolsS.get(name).execute(input)).content;
+    runS = async (name, input) => (await toolsS.get(name).execute(withForce(name, input))).content;
     cmdS = async (name, text = '', sessionID = 's1') => {
       await cmdsS.get(name).execute({ sessionID, prompt: { text } });
       return promptsS.at(-1);
@@ -3226,7 +3251,7 @@ describe('高风险软卡 approve（10-30-swarm-approve-softcard，五例锁死�
       tool: { transform: async (fn) => fn({ add: (d) => toolsA.set(d.name, d) }) },
     };
     await plugin.setup(ctxA);
-    runA = async (name, input) => (await toolsA.get(name).execute(input)).content;
+    runA = async (name, input) => (await toolsA.get(name).execute(withForce(name, input))).content;
     cmdA = async (name, text = '', sessionID = 's1') => {
       await cmdsA.get(name).execute({ sessionID, prompt: { text } });
       return promptsA.at(-1);
@@ -3322,7 +3347,7 @@ describe('plan 非空轮提示（只提示不拦截，独占 run）', () => {
       tool: { transform: async (fn) => fn({ add: (d) => toolsP.set(d.name, d) }) },
     };
     await plugin.setup(ctxP);
-    runP = async (name, input) => (await toolsP.get(name).execute(input)).content;
+    runP = async (name, input) => (await toolsP.get(name).execute(withForce(name, input))).content;
     cmdP = async (name, text = '', sessionID = 's1') => {
       await cmdsP.get(name).execute({ sessionID, prompt: { text } });
       return promptsP.at(-1);
@@ -3402,7 +3427,7 @@ describe('空轮不继承旧会话（W3-T1：空轮零继承 + 禁跨轮唤醒�
     await plugin.setup(ctxM);
     return {
       d, prompts, promptCalls, sessions,
-      run: async (name, input) => (await toolsM.get(name).execute(input)).content,
+      run: async (name, input) => (await toolsM.get(name).execute(withForce(name, input))).content,
       cmd: async (name, text = '', sessionID = 'caller') => {
         await cmdsM.get(name).execute({ sessionID, prompt: { text } });
         return prompts.at(-1);
@@ -3686,5 +3711,122 @@ describe('npm 包自带技能与 init（skills 随插件注册 + swarm-init 落�
     assert.match(r.reason, /gate=tenant/);
     assert.match(r.evidence.stderr, /SWARM_TENANT_CHECK|tenant_cmd/, '无脚本应指引配脚本，而非晦涩报错');
     assert.doesNotMatch(r.evidence.stderr ?? '', /smarterlab-backend.*ENOENT/i, '不得是裸路径缺失错');
+  });
+});
+
+describe('P0/P1 编排闸门（并行两轮隔离 / start 授权 / 空入队不改名）', () => {
+  let d;
+  let t;
+  let c;
+  let sess;
+  let prompts;
+  let seq;
+
+  const up = (sid, text) => c.get('swarm-up').execute({ sessionID: sid, prompt: { text } });
+  const tool = async (sid, name, input) => (await t.get(name).execute(input, { sessionID: sid })).content;
+  const cmdN = async (sid, name, text = '') => {
+    await c.get(name).execute({ sessionID: sid, prompt: { text } });
+    return prompts.at(-1)?.text;
+  };
+  const readRoundOf = (runId) => JSON.parse(readFileSync(join(d, '.swarm', 'runs', runId, 'round.json'), 'utf8'));
+  const readQueueOf = (runId) => {
+    try {
+      return readFileSync(join(d, '.swarm', 'runs', runId, 'queue.jsonl'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    } catch {
+      return [];
+    }
+  };
+  const tA = { id: 'A-1', wave: 'W1', title: 'A 任务一', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false };
+  const tA2 = { id: 'A-2', wave: 'W1', title: 'A 任务二', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false };
+
+  before(async () => {
+    d = mkdtempSync(join(tmpdir(), 'swarm-gate-'));
+    writeFileSync(join(d, 'ok.mjs'), 'process.exit(0);\n');
+    prompts = [];
+    sess = new Map();
+    seq = 0;
+    t = new Map();
+    c = new Map();
+    const ctx = {
+      location: { directory: d },
+      options: { channel: 'swarm-gate-none', maxRetries: 3, verifyTimeoutMs: 10_000 },
+      model: { list: async () => [] },
+      session: {
+        prompt: async ({ sessionID, text }) => { prompts.push({ sessionID, text }); },
+        create: async ({ title, agent, model }) => {
+          const id = `g-${++seq}`;
+          sess.set(id, { id, title, agent, model });
+          return { id, title };
+        },
+        get: async ({ sessionID }) => sess.get(sessionID),
+        update: async ({ sessionID, title }) => {
+          const s = sess.get(sessionID) ?? { id: sessionID };
+          s.title = title;
+          sess.set(sessionID, s);
+        },
+        switchModel: async () => {},
+        hook: async () => {},
+      },
+      command: { transform: async (fn) => fn({ add: (x) => c.set(x.name, x) }) },
+      tool: { transform: async (fn) => fn({ add: (x) => t.set(x.name, x) }) },
+    };
+    await plugin.setup(ctx);
+  });
+
+  after(() => { rmSync(d, { recursive: true, force: true }); });
+
+  test('并行两轮：B 会话入队/读队列都落 B，不被全局 current=A 串走', async () => {
+    await up('hostA', '--executor sessions --name 需求A');
+    await up('hostB', '--executor sessions --name 需求B'); // current 指向 B
+    await cmdN('hostA', 'swarm-switch', '--run 需求A'); // 故意把 current 抢回 A（模拟并行两轮）
+    const planB = await tool('hostB', 'swarm_plan', { name: '需求B', tasks: [tA] });
+    assert.match(planB, /A-1: queued/);
+    assert.equal(readQueueOf('需求B').length, 1, 'B 会话的任务必须落 B');
+    assert.equal(readQueueOf('需求A').length, 0, 'A 轮不得被 B 的入队污染');
+    const qa = await tool('hostA', 'swarm_read_queue', {});
+    const qb = await tool('hostB', 'swarm_read_queue', {});
+    assert.doesNotMatch(qa, /A-1/, 'A 会话读 A（空队列）');
+    assert.match(qb, /A-1/, 'B 会话读 B（有任务）');
+  });
+
+  test('会话绑定登记进 round.members（footer/sidebar 跟随的数据源）', async () => {
+    const r = readRoundOf('需求A');
+    assert.ok(r.members?.['hostA'], '主会话应登记进 members');
+    assert.equal(r.sessions.plan, 'hostA', '默认主会话即 planner');
+  });
+
+  test('start 闸门：up 后认领被拒，/swarm-start 后才放行', async () => {
+    const rejected = await tool('hostB', 'swarm_claim', { task_id: 'A-1' });
+    assert.match(rejected, /已 plan 未派发/);
+    assert.match(rejected, /swarm-start/);
+    assert.equal(readQueueOf('需求B')[0].status, 'queued', '闸门拒绝不得改状态');
+
+    const started = await cmdN('hostB', 'swarm-start');
+    assert.match(started, /已派发 A-1/);
+    const meta = JSON.parse(readFileSync(join(d, '.swarm/runs/需求B/meta.json'), 'utf8'));
+    assert.ok(meta.startedAt, 'start 后写 startedAt');
+    assert.equal(meta.pendingStart, false);
+
+    // 第一个任务已由 start 派给 dev（可继续），再入队一个任务验证 start 后 claim 放行
+    await tool('hostB', 'swarm_plan', { tasks: [tA2] });
+    const ok = await tool('hostB', 'swarm_claim', { task_id: 'A-2' });
+    assert.match(ok, /已认领 A-2/);
+  });
+
+  test('空入队（全部被校验拒）不得改轮名', async () => {
+    const before = readRoundOf('需求B').name;
+    const out = await tool('hostB', 'swarm_plan', { name: '不该生效的名字', tasks: [{ id: 'BAD', wave: 'W1', title: '缺验收' }] });
+    assert.match(out, /BAD: missing\/invalid field/);
+    assert.match(out, /未改名/);
+    assert.equal(readRoundOf('需求B').name, before, 'round.name 必须原样');
+    assert.equal(JSON.parse(readFileSync(join(d, '.swarm/runs/需求B/meta.json'), 'utf8')).name, before, 'meta.name 同步不动');
+  });
+
+  test('同一主会话开新轮：host 从旧轮摘走，归属新轮', async () => {
+    await up('hostB', '--executor sessions --name 需求C');
+    assert.ok(!readRoundOf('需求B').members?.['hostB'], '旧轮 members 不得留 hostB');
+    assert.ok(!Object.values(readRoundOf('需求B').sessions).includes('hostB'), '旧轮 sessions 不得留 hostB');
+    assert.equal(readRoundOf('需求C').sessions.plan, 'hostB', '新轮 hostB 即 planner');
   });
 });

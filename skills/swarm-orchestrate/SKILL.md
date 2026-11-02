@@ -19,8 +19,8 @@ description: "主会话自然语言编排 swarm 轮次：人话开工，全程�
 
 | 用户人话 | 意图 | 动作 |
 |---|---|---|
-| "这个 bug 修一下 / 挂了，再看看" | bugfix | `swarm_read_queue` 找命中任务则复用，否则 `swarm_plan` 建单任务 → 派 dev 会话直接开工（wake 已投递）→ 修完走 `subagent(test)` → 验收通过主会话调 `/swarm-clean` 归档（人不敲命令） |
-| "加个功能 / 改一版 / 来个新需求…" | 新需求 | 小活直接拆成任务，大活开 planner 会议再拆 → `swarm_plan` 批量 → 按 wave 派 → 每个任务 test pass 后立刻加载 `swarm-quality` 走一遍（先于 reviewer；有 High 回 dev，无问题进 reviewer/drained） |
+| "这个 bug 修一下 / 挂了，再看看" | bugfix | `swarm_read_queue` 找命中任务则复用，否则 `swarm_plan` 建单任务 → **`/swarm-start` 派发** → 派 dev 会话/子代理开工 → 修完走 `subagent(test)` → 验收通过主会话调 `/swarm-clean` 归档（人不敲命令） |
+| "加个功能 / 改一版 / 来个新需求…" | 新需求 | 小活直接拆成任务，大活开 planner 会议再拆 → `swarm_plan` 批量 → **`/swarm-start`** → 按 wave 派 → 每个任务 test pass 后立刻加载 `swarm-quality` 走一遍（先于 reviewer；有 High 回 dev，无问题进 reviewer/drained） |
 | "再测一遍 / 验证下 W1-T1" | 复测 | 派 `subagent(test)`，带 `verify_cmd` + 边界 |
 | "现在啥情况 / 到哪了" | 进度 | 读队列 + timeline，回一句话（做了什么/卡在哪/谁在跑） |
 | "别跑了 / 停 / 回滚重来" | 叫停 | `swarm_halt` 熔断；要重做再 `swarm_revert` |
@@ -34,8 +34,8 @@ description: "主会话自然语言编排 swarm 轮次：人话开工，全程�
 
 ```
 swarm_read_queue 看现状 → 按 §2 分类意图 →
-  bugfix: swarm_read_queue 找命中则复用 else swarm_plan 建单任务 → dev会话直接开工（wake已投递，prompt=验收+verify_cmd+上次失败史）→ 修完派 subagent(test, model=roleModels.test, prompt=verify_cmd+边界) → test pass 后主会话加载 swarm-quality 走一遍（只建议不拦截；有 High 回 dev，无问题照常往下）→ 再执行 /swarm-clean 归档（人不敲命令，整轮搬运可审计）
-  新需求: 小活直接拆 / 大活开 planner 会议 → swarm_plan 批量 → 按 wave 派 dev/test → 每个任务 test pass 后立刻加载 swarm-quality 巡检（先于 reviewer；有 High 回 dev，无问题进 reviewer/drained）
+  bugfix: swarm_read_queue 找命中则复用 else swarm_plan 建单任务 → /swarm-start 派发（未 start 前认领会被闸门拒）→ dev 会话/子代理开工（prompt=验收+verify_cmd+上次失败史）→ 修完派 subagent(test, model=roleModels.test, prompt=verify_cmd+边界) → test pass 后主会话加载 swarm-quality 走一遍（只建议不拦截；有 High 回 dev，无问题照常往下）→ 再执行 /swarm-clean 归档（人不敲命令，整轮搬运可审计）
+  新需求: 小活直接拆 / 大活开 planner 会议 → swarm_plan 批量 → /swarm-start → 按 wave 派 dev/test → 每个任务 test pass 后立刻加载 swarm-quality 巡检（先于 reviewer；有 High 回 dev，无问题进 reviewer/drained）
   复测: subagent(test, model=roleModels.test, prompt=verify_cmd+边界)
   进度: 读队列+timeline 报一句话
   叫停: swarm_halt / swarm_revert（tool 版，与命令同逻辑）
@@ -43,7 +43,11 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 汇报（做了什么 / 验证证据 verify_cmd 输出 / 要人看什么：验收勾选或 retry/revert 二选一）
 ```
 
+- **默认主会话即 planner**：`/swarm-up` 不再另建 plan 会话（`plan = 当前会话`），直接在窗口里 `#plan 拆解 <需求>`；要旧行为加 `--plan-session new`。
+- **`/swarm-start` 是唯一派发授权**：`/swarm-up` 只开轮不派发；未 start 前 `swarm_claim/swarm_next` 会被闸门拒收（逃生口 `force:true`）。planner 入队后必须由人（或主会话代跑）执行 `/swarm-start`。
+- **并行多轮**：run 解析优先级 = 显式 `run` > 任务归属（带 task_id 时）> 会话绑定（`round.json` 的 sessions/members）> 全局 `.swarm/current`。同一会话开新轮会被自动从旧轮摘走；不同窗口并行互不抢指针。
 - dev（会话 wake 为主）prompt = 任务 JSON + 验收标准 + `verify_cmd` + 上次 fail 的 `detail/failed_ids`（时间线现成，直接复用；自然语言 bug 全程不让人碰 dev 会话，主会话代跑唤醒）。
+  - **prompt 首行写 `run=<runId>`**，并让子代理在工具调用里带上 `run`；插件也会按 `task_id` 兜底反查，但显式带上更稳。
 - test 子代理 prompt = 任务 JSON + `verify_cmd` + 边界要求。
 - reviewer（review=true 任务 test pass 后）prompt = 任务 JSON + `git show <commit>` diff（截断 50KB）+ REVIEW.md 命中 + `excluded=[finding ids]`。
 - 判活口径与 `/swarm-drained` 同调：queued 空 + 无 `dev_doing/test_doing/reviewing` 即结束。

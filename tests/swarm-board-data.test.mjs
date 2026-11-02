@@ -422,11 +422,38 @@ describe('sessionRunIndex：多 run 合并', () => {
     assert.deepEqual(idx['ses_follow_test'], { runId: 'follow-idx-b', role: 'test' });
   });
 
+  test('members（主会话/子代理）也进索引 —— footer 才能跟随', () => {
+    putRun('follow-idx-m', {
+      'round.json': JSON.stringify({ name: 'M', sessions: { plan: 'ses_m_plan' }, members: { ses_m_host: { role: 'host' }, ses_m_sub: { role: 'dev' } } }),
+    });
+    const idx = sessionRunIndex(dir);
+    assert.deepEqual(idx['ses_m_host'], { runId: 'follow-idx-m', role: 'host' });
+    assert.deepEqual(idx['ses_m_sub'], { runId: 'follow-idx-m', role: 'dev' }, '子代理也能反查到所属轮');
+    assert.equal(resolveFooterRun('ses_m_sub', idx, 'other-run'), 'follow-idx-m', 'footer 命中子代理即跟随，不落 current');
+  });
+
   test('缺 round 的轮跳过不崩', () => {
     mkdirSync(runDir('follow-idx-empty'), { recursive: true });
     let idx;
     assert.doesNotThrow(() => { idx = sessionRunIndex(dir); });
     assert.ok(idx['ses_follow_dev'], '已有索引不受空轮影响');
+  });
+});
+
+describe('listRunSummaries：名字口径（meta 优先，防两轮同名）', () => {
+  test('meta.name 与 round.name 漂移时以 meta 为准；缺 meta 才回 round', () => {
+    putRun('name-meta', {
+      'queue.jsonl': JSON.stringify(task()) + '\n',
+      'meta.json': JSON.stringify({ runId: 'name-meta', name: '按瓶借用毛重' }),
+      'round.json': JSON.stringify({ name: '移动端待入库（被污染）', sessions: {} }),
+    });
+    putRun('name-round', {
+      'queue.jsonl': JSON.stringify(task()) + '\n',
+      'round.json': JSON.stringify({ name: '只有 round 名', sessions: {} }),
+    });
+    const byId = Object.fromEntries(listRunSummaries(dir).map((s) => [s.runId, s]));
+    assert.equal(byId['name-meta'].name, '按瓶借用毛重', 'meta 是规范名，round 漂移不覆盖');
+    assert.equal(byId['name-round'].name, '只有 round 名', '缺 meta 兜底 round');
   });
 });
 

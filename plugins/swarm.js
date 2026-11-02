@@ -43,6 +43,7 @@ import {
   ensureRunMeta, listRuns, migrateLegacy, displayPath,
   rebuildQueueFromTimeline, readTimeline, stateBeforeLastGateEnter,
   readMeta, writeMeta, normalizeExecutor, executorForRole,
+  runIdForSession, runIdForTask,
   DISPOSITIONS, roundsToPass, dispositionDist, lastFailDetails,
   validateFindings, validateReviewVerdict, mergeFindings,
   excludedFindingIds, resolveReviewDoc,
@@ -408,11 +409,79 @@ export default {
     // 否则会误建出名为 `true` 的轮并污染 current 指针。
     const cmdRun = (f) => (f?.run && f.run !== 'true' ? f.run : undefined);
     const currentRunId = () => resolveRun(cwd, { cfgRunId: rawRunId }).runId;
+    /**
+     * 工具/命令调用应操作的轮（并行两轮的唯一隔离点）：
+     * 显式 input.run > 任务归属（带 task_id 时）> 会话绑定 > `.swarm/current`。
+     * toolCtx.sessionID 由宿主传入（swarm_approve 早已在用）；拿不到会话时退回 current（老行为）。
+     */
+    const sessionOf = (toolCtx, input) => {
+      const sid = toolCtx?.sessionID ?? toolCtx?.sessionId ?? input?.sessionID ?? input?.sessionId;
+      return typeof sid === 'string' && sid.trim() ? sid.trim() : null;
+    };
+    const runIdForCall = (input, toolCtx, taskId) => {
+      const sid = sessionOf(toolCtx, input);
+      return sanitizeRunId(
+        input?.run
+        // 任务归属先于会话绑定：带 task_id 的调用（claim/done/test/review…）以任务所在轮为准，
+        // 会话万一被旧轮/误绑占着也不会把任务写错轮（子代理最常踩）。
+        ?? (taskId ? runIdForTask(cwd, taskId) : null)
+        ?? runIdForSession(cwd, sid)
+        ?? currentRunId(),
+      );
+    };
+    /**
+     * 首次调用即把会话登记为这一轮的成员（members，不参与改名/唤醒）：
+     * 解决「主会话与子代理从来不在 round.sessions 里 → footer/sidebar 永远回退 current」。
+     * 幂等（已登记即返回），写失败静默。
+     */
+    function bindSession(runId, sid, role = 'agent') {
+      if (!sid) return;
+      try {
+        const rr = resolveRun(cwd, { run: runId, cfgRunId: rawRunId });
+        const cur = readRound(rr.runDir);
+        if (cur?.members?.[sid]) return;
+        writeRoundFor(runId, { members: { [sid]: { role: String(role).slice(0, 20), at: new Date().toISOString() } } });
+      } catch { /* best-effort */ }
+    }
+    /**
+     * 会话换轮（同一主会话 /swarm-up 开新需求）：从其它轮台账里摘掉该 sid，
+     * 否则「会话 → run」会继续把这个会话判给旧轮，新轮反而成了外来会话。
+     * 只清 sessions/members，不动队列/时间线。永不抛错。
+     */
+    function unbindSessionFromOtherRuns(sid, keepRunId) {
+      if (!sid) return;
+      try {
+        for (const r of listRuns(cwd)) {
+          if (r.runId === keepRunId) continue;
+          const rr = resolveRun(cwd, { run: r.runId, cfgRunId: rawRunId });
+          const cur = readRound(rr.runDir);
+          const hitSessions = Object.values(cur?.sessions ?? {}).includes(sid);
+          const hitMember = !!cur?.members?.[sid];
+          if (!hitSessions && !hitMember) continue;
+          const sessions = Object.fromEntries(Object.entries(cur.sessions ?? {}).filter(([, v]) => v !== sid));
+          const members = Object.fromEntries(Object.entries(cur.members ?? {}).filter(([k]) => k !== sid));
+          writeRoundFor(r.runId, { sessions, members }, { replaceSessions: true, replaceMembers: true });
+        }
+      } catch { /* best-effort */ }
+    }
+    /** 本轮是否「已 plan、尚未 /swarm-start」：仅 up 开轮会置位，老轮/legacy 队列不受影响。 */
+    const isPendingStart = (runId) => {
+      try { return (readMeta(cwd, runId) ?? {}).pendingStart === true; } catch { return false; }
+    };
+    const START_GATE_HINT = '本轮已 plan 未派发：先执行 `/swarm-start`（或在本会话发 `/swarm-start --run <id>`），派发后 dev/test 才能认领。';
+    /** up 开轮即上锁；已 start 过的轮重跑 up（换模型等）不重新上锁，免得把进行中的 dev 卡住。 */
+    function armStartGate(runId) {
+      try {
+        const m = readMeta(cwd, runId) ?? {};
+        if (!m.startedAt) writeMeta(cwd, runId, { pendingStart: true });
+      } catch { /* best-effort */ }
+    }
     const queueFor = (run) => resolveRun(cwd, { run, queue: effQueue(), cfgRunId: rawRunId }).queuePath;
     // timeline 按 run 落（run 目录的 timeline.jsonl）；显式 input.queue 是兼容通道，
     // timeline 仍归所属 run，保证 rebuild 对得上插件实际写的位置。
     const timelineFor = (run) => resolveRun(cwd, { run, queue: effQueue(), cfgRunId: rawRunId }).timelinePath;
 
+    const cmdRunFor = (f, sid) => sanitizeRunId(cmdRun(f) ?? runIdForSession(cwd, sid) ?? currentRunId());
     // FileBus 按 run 建实例，小缓存（上限 20，LRU 丢）；tail 自带旧位回退。
     const busCache = new Map();
     function busFor(run) {
@@ -473,7 +542,13 @@ export default {
     function writeRoundFor(run, patch, opts = {}) {
       const rr = resolveRun(cwd, { run, cfgRunId: rawRunId });
       const next = writeRound(rr.runDir, patch, opts);
-      try { ensureRunMeta(cwd, rr.runId, next.name ? { name: next.name } : undefined); } catch { /* best-effort */ }
+      try {
+        // meta.name 与 round.name 是同一件事的两个存放点：round 改名（#plan / swarm_plan /
+        // /swarm-start）必须同步 meta，否则 sidebar（曾读 round）与 status（读 meta）长期漂移，
+        // 「同一个轮两个名字」就是这么来的。ensureRunMeta 只在缺名时补，不能承担同步职责。
+        if (next.name) writeMeta(cwd, rr.runId, { name: next.name });
+        else ensureRunMeta(cwd, rr.runId);
+      } catch { /* best-effort */ }
       if (rr.runId === currentRunId()) {
         // 镜像位与自有位同语义（含 replaceSessions）：只写不读，但别让它留一份删不掉的脏 sessions。
         try { writeRound(legacyStateDir, patch, opts); } catch { /* best-effort */ }
@@ -502,6 +577,14 @@ export default {
             const hits = map.get(id) ?? [];
             hits.push({ runId: r.runId, name: data.name ?? '', role, createdAt });
             map.set(id, hits);
+          }
+          // 动态成员（主会话 host / 子代理 / 任意调过 swarm 工具的会话）：只参与归属判定，
+          // role 置空 → title hook 不改它们的标题（它们不是角色会话）。
+          for (const sid of Object.keys(data.members ?? {})) {
+            if (!sid) continue;
+            const hits = map.get(sid) ?? [];
+            hits.push({ runId: r.runId, name: data.name ?? '', role: null, createdAt });
+            map.set(sid, hits);
           }
         }
       } catch { /* 索引失败 fail-open：不因为读不到别人的轮就阻断本轮唤醒 */ }
@@ -943,7 +1026,8 @@ export default {
       const text = event.prompt?.text ?? '';
       const tag = parseTag(text);
       if (!tag) return;
-      const runId = currentRunId();
+      // 会话优先：并行两轮时不能再让全局 current 决定「这一句 #plan/#dev 属于谁」。
+      const runId = sanitizeRunId(runIdForSession(cwd, event.sessionID) ?? currentRunId());
       const task = tag.taskId ? loadQueue(queueFor(runId)).find((t) => t.id === tag.taskId) : undefined;
       const expanded = expandTag(tag, task);
       if (!expanded) return;
@@ -981,9 +1065,11 @@ export default {
       if (!sid) return;
       const hit = sidToRun(sid);
       const runId = hit?.runId ?? currentRunId();
-      const sessions = hit ? { [hit.role]: sid } : roleSessionsFor(runId);
+      const sessions = hit ? (hit.role ? { [hit.role]: sid } : roleSessionsFor(runId)) : roleSessionsFor(runId);
       const role = Object.keys(sessions).find((r) => sessions[r] === sid);
-      if (!role) return;
+      // 非角色会话（members：主会话 host / 子代理）不改标题：它们没有 · role 后缀语义，
+      // 硬套 roleTitle 会写出 `需求 · null`；让自动标题/用户命名保持原样。
+      if (!role || !hit?.role) return;
       const name = hit?.name || roundNameFor(runId);
       if (!name) return;
       event.result = { title: roleTitle(name, role) ?? `${name} · ${role}` };
@@ -1140,6 +1226,7 @@ export default {
                 // hadTasks 先记（--force 复用非空轮时文案不谎报 queue 空）；
                 // 本轮自有位只读 round（不回退旧全局位，防脏 default 台账污染新轮初始化）。
                 const hadTasks = runQueueHasTasks(cwd, upRun);
+                const hostSid = (typeof sessionID === 'string' && sessionID.trim()) ? sessionID.trim() : null;
                 try {
                   const qpEmpty = queueFor(upRun);
                   if (!existsSync(qpEmpty)) {
@@ -1162,17 +1249,23 @@ export default {
                     && typeof prevRound.sessions === 'object'
                     && Object.keys(prevRound.sessions).length > 0;
                   keptSessions = !!hasSessions;
+                  if (hostSid) unbindSessionFromOtherRuns(hostSid, upRun);
                   const patchEmpty = {
                     ...(upName ? { name: upName } : {}),
+                    ...(hostSid ? { members: { [hostSid]: { role: 'host', at: new Date().toISOString() } } } : {}),
                     ...(!prevRound || !prevRound.createdAt ? { createdAt: new Date().toISOString() } : {}),
                   };
                   if (!hasSessions) {
+                    // 空轮不登记角色会话（e2e 锁死「空轮零会话」）；只把主会话记进 members，
+                    // 供「会话 → run」反查（不参与改名/唤醒）。
                     patchEmpty.sessions = {};
                     writeRoundFor(upRun, patchEmpty, { replaceSessions: true });
                   } else if (Object.keys(patchEmpty).length) {
                     writeRoundFor(upRun, patchEmpty);
                   }
                 } catch { /* best-effort */ }
+                // P1：空轮同样是「已开轮未派发」，dev/test 在 /swarm-start 前认领一律拒收。
+                armStartGate(upRun);
                 try { writeCurrentRunId(cwd, upRun); } catch { /* best-effort */ }
                 // 复用分支文案不谎报：非空轮 --force / 有会话轮复用各走各的 state 行；
                 // 纯空轮分支文案逐字锁定（e2e 断言），不动。
@@ -1264,10 +1357,29 @@ export default {
             const isHybridUp = upExecutor === 'hybrid';
             const explicitRoles = f.roles !== undefined && f.roles !== 'true';
             const name = oneLine(f.name ?? f.title ?? '', 60);
+            // P0：主会话即 planner（默认）。旧行为（另建 plan 会话）用 --plan-session new 保留。
+            // planner 与主会话是同一个会话，才有「在主会话里 #plan 描述需求」的入口；
+            // 否则 #plan 只能由用户在另一个窗口里敲，main 会话会自行脑补需求（10-31 事故）。
+            const planModeRaw = String(f.plan_session ?? f.plan ?? 'host').trim().toLowerCase();
+            const planMode = (planModeRaw === 'new' || planModeRaw === 'session') ? 'new' : 'host';
+            const hostSid = (typeof sessionID === 'string' && sessionID.trim()) ? sessionID.trim() : null;
+            const planIsHost = planMode === 'host' && !!hostSid && roles.includes('plan');
             const report = [];
             const sessions = {};
+            const members = {};
             const errors = [];
+            if (planIsHost) {
+              // 本会话既是主会话（host）也是 planner：工具解析按 members/sessions 反查，
+              // 不再依赖全局 .swarm/current（并行两轮的串轮来源）。
+              sessions.plan = hostSid;
+              members[hostSid] = { role: 'host', at: new Date().toISOString() };
+              report.push(`- plan ✓ \`${hostSid}\` · 本会话（主会话即 planner，测试/派发仍在同一窗口）`);
+            } else if (hostSid) {
+              // plan=new 或 --roles 不含 plan：主会话仍登记为 host 成员，footer/sidebar 才能跟随。
+              members[hostSid] = { role: 'host', at: new Date().toISOString() };
+            }
             for (const role of roles) {
+              if (planIsHost && role === 'plan') continue;
               const def = ROLES[role];
               if (!def.agent) {
                 errors.push(`- **${role}**：该角色为占位（subagent 专属，不经 /swarm-up 建会话）——先用 plan/dev/test 干活，reviewer 由编排会话在 test pass 后按需派发`);
@@ -1326,7 +1438,9 @@ export default {
             // ④ 落台账（供改名/唤醒/status 使用）：登记到该 run。新轮 sessions 从空起
             // （replaceSessions，只登记本次新建的，不合并旧轮残留 ID，防唤醒打到昨天的死会话；
             // 空轮/同轮复用时旧 sessions 本就为空，老行为零变）。
-            // 有 --name 时 meta/round 双写一致（writeMeta 覆盖旧名；无 --name 不动，老行为）。
+            // 有 --name 时 meta/round 双写一致（writeRoundFor 已同步 meta；无 --name 不动，老行为）。
+            // 会话换轮：同一主会话开新需求时，先从旧轮台账摘掉，否则它仍被判给旧轮。
+            if (hostSid) unbindSessionFromOtherRuns(hostSid, upRun);
             try {
               if (name) writeMeta(cwd, upRun, { name });
               else ensureRunMeta(cwd, upRun);
@@ -1334,25 +1448,36 @@ export default {
             const hasRound = writeRoundFor(upRun, {
               ...(name ? { name } : {}),
               sessions,
+              members,
               ...(Object.keys(sessions).length && !readRoundFor(upRun).createdAt ? { createdAt: new Date().toISOString() } : {}),
             }, { replaceSessions: true });
+            // P1：up 只开轮不派发 —— 置 pendingStart，dev/test 在 /swarm-start 之前认领一律拒收。
+            armStartGate(upRun);
+            // 主会话即 planner 时，把主会话标题直接改成需求名（#plan 也会改名，这里先对齐）。
+            if (planIsHost && name) {
+              try { await nameRound(name, { currentSessionID: hostSid, run: upRun }); } catch { /* best-effort */ }
+            }
             // 新轮落盘成功后必写 current（认领的是“新轮创建”这件事本身，不再以显式 --run 为条件）；
             // 显式 --run 的认领在上面已发生（老行为零变），这里只补派生轮。
             if (derivedUpRun) writeCurrentRunId(cwd, upRun);
 
-            const head = `## swarm-up${isSubUp ? '（subagents：仅 plan 建会话）' : (isHybridUp ? '（hybrid：plan+dev 建会话，test走子代理）' : '')}\n${report.join('\n')}`;
-            const subTail = `\n\n下一步：在 planner 会话里用 \`#plan 拆解 <需求>\`（会自动把这一轮会话改成需求名），` +
-              `或直接 \`/swarm-start\` 派发已有队列（默认 hybrid）。` +
+            const planHead = planIsHost ? 'plan=本会话' : 'plan';
+            const head = `## swarm-up${isSubUp ? `（subagents：${planHead}，dev/test 走子代理）` : (isHybridUp ? `（hybrid：${planHead} + dev，test走子代理）` : '')}\n${report.join('\n')}`;
+            const planHint = planIsHost
+              ? '本会话就是 planner：直接在这里 `#plan 拆解 <需求>` → `swarm_plan` 入队 → `/swarm-start` 派发。'
+              : '在 planner 会话里用 `#plan 拆解 <需求>`（会自动把这一轮会话改成需求名），';
+            const startGateNote = '入队后必须 `/swarm-start` 才算派发（up 不会自动派发；未 start 前 dev/test 认领会被拒）。';
+            const subTail = `\n\n下一步：${planHint}` +
+              `${startGateNote}` +
               `dev/test 由编排会话按 /swarm-mode recipe 派 subagent，不建会话（模型已记入 meta，编排循环见 /swarm-mode）。`;
-            const hybridTail = `\n\n下一步：在 planner 会话里用 \`#plan 拆解 <需求>\`（会自动把这一轮会话改成需求名），` +
-              `或直接 \`/swarm-start\` 派发已有队列（默认 hybrid：dev常驻唤醒）。` +
+            const hybridTail = `\n\n下一步：${planHint}` +
+              `${startGateNote}` +
               `test/reviewer 由编排会话按 /swarm-mode recipe 派 subagent，不建会话（模型已记入 meta，编排循环见 /swarm-mode）。`;
             const tail = errors.length
               ? `\n\n### 失败\n${errors.join('\n')}${isSubUp ? subTail : (isHybridUp ? hybridTail : '')}`
               : (isSubUp ? subTail
                 : (isHybridUp ? hybridTail
-                : `\n\n下一步：在 planner 会话里用 \`#plan 拆解 <需求>\`（会自动把这一轮会话改成需求名），` +
-                  `或直接 \`/swarm-start\` 派发已有队列（会自动唤醒 dev）。`));
+                : `\n\n下一步：${planHint}` + `${startGateNote}`));
             const roundLine = hasRound?.name ? `\n本轮：**${hasRound.name}**` : '';
             return reply(`${head}${roundLine}${tail}${errors.length ? '\n\n（失败的会话没有创建，修正后重跑 /swarm-up 即可）' : ''}`);
           } catch (e) {
@@ -1372,7 +1497,8 @@ export default {
             if (f.channel) cfg.channel = f.channel;
             if (f.no_wake === 'true') cfg.autoWake = false;
             if (f.wake === 'true') cfg.autoWake = true;
-            const startRun = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            // 会话优先：并行两轮时，用当前窗口所属的轮，而不是全局 current（后者可能被另一轮抢走）。
+            const startRun = sanitizeRunId(cmdRun(f) ?? runIdForSession(cwd, sessionID) ?? currentRunId());
             // 失败零落盘：先判队列存在（不存在直接回，不写 meta 不动 current），
             // 再 applyExecutorFlags（含模型校验），合法才 writeCurrentRunId。
             const qp = queueFor(startRun);
@@ -1397,6 +1523,9 @@ export default {
               if (typeof sessionID === 'string' && sessionID.trim()) writeMeta(cwd, startRun, { notify: { requester: sessionID } });
             } catch { /* best-effort */ }
             const nameLine = name ? `\n本轮：**${name}**（run=${startRun}）` : '\n（本轮没有需求名：用 `/swarm-up --name 需求名` 或 `#plan <需求>` 可以让三个会话按需求命名）';
+            // P1：start 即授权派发 —— 清 pendingStart，此后 dev/test 认领才放行。
+            try { writeMeta(cwd, startRun, { startedAt: new Date().toISOString(), pendingStart: false }); } catch { /* best-effort */ }
+            bindSession(startRun, sessionID, 'host');
             const r = await dispatchNext(startRun);
             if (!r.dispatched) {
               return reply(`无可派发任务（${r.drained ? '队列已空' : r.reason}）${nameLine}`);
@@ -1418,7 +1547,7 @@ export default {
         execute: async ({ sessionID, prompt }) => {
           const f = parseFlags(prompt?.text ?? '');
           if (f.task && f.task !== 'true') {
-            const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            const runId = cmdRunFor(f, sessionID);
             const rr = resolveRun(cwd, { run: runId, cfgRunId: rawRunId });
             const cur = loadQueue(queueFor(runId)).find((t) => t.id === f.task);
             const rows = readTimeline(rr.runDir).filter((r) => r.taskId === f.task);
@@ -1456,7 +1585,7 @@ export default {
             });
             return;
           }
-          const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+          const runId = cmdRunFor(f, sessionID);
           const qp = queueFor(runId);
           const tasks = loadQueue(qp);
           const tail = (await tailFor(runId, 6)).map((e) => `- seq${e.seq} ${e.by}: ${String(e.text).split('\n')[0]}`).join('\n');
@@ -1556,7 +1685,7 @@ export default {
           const reply = (text) => ctx.session.prompt({ sessionID, text });
           try {
             const f = parseFlags(prompt?.text ?? '');
-            const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            const runId = cmdRunFor(f, sessionID);
             const setHint = (f.executor !== undefined && f.executor !== 'true') || f.dev_model !== undefined || f.tester_model !== undefined || f.reviewer_model !== undefined
               ? '\n\n⚠️ /swarm-mode 是只读的：改执行器/模型走 `/swarm-start --executor sessions|subagents|hybrid --dev-model a/b --tester-model c/d --reviewer-model e/f [--run <id>]`（本次 flags 已忽略，只展示现状）。'
               : '';
@@ -1593,7 +1722,7 @@ export default {
           const reply = (text) => ctx.session.prompt({ sessionID, text });
           try {
             const f = parseFlags(prompt?.text ?? '');
-            const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            const runId = cmdRunFor(f, sessionID);
             const qp = queueFor(runId);
             // 纯读：只 loadQueue + 回复，不调 transition、不 wake、不 emit、不写 timeline/meta。
             if (!existsSync(qp)) return reply(`## swarm-drained（run=${runId}）\n✅ drained：队列文件不存在（无任务，视为 drained，只读，未改任何状态）`);
@@ -1624,7 +1753,7 @@ export default {
           const reply = (text) => ctx.session.prompt({ sessionID, text });
           try {
             const f = parseFlags(prompt?.text ?? '');
-            const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            const runId = cmdRunFor(f, sessionID);
             const rawMonth = f.month && f.month !== 'true' ? String(f.month).trim() : '';
             const month = rawMonth || new Date().toISOString().slice(0, 7);
             if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
@@ -1777,7 +1906,7 @@ export default {
             if (!cmdRun(f) && readCurrentRunId(cwd) == null) {
               return reply('暂无轮次（current 为空），无需清理（/swarm-up 开新轮）');
             }
-            const target = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            const target = cmdRunFor(f, sessionID);
             const rr = resolveRun(cwd, { run: target, cfgRunId: rawRunId });
             if (!existsSync(rr.runDir)) return reply(`轮不存在：${target}（${displayPath(cwd, rr.runDir)} 缺失）`);
             let note = '';
@@ -1822,7 +1951,7 @@ export default {
           const reply = (text) => ctx.session.prompt({ sessionID, text });
           try {
             const f = parseFlags(prompt.text ?? '');
-            const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            const runId = cmdRunFor(f, sessionID);
             // 队列解析与其它命令一致（显式 --queue 是兼容通道）；timeline 恒归所属 run。
             const rr = resolveRun(cwd, { run: runId, queue: f.queue ?? effQueue(), cfgRunId: rawRunId });
             const current = loadQueue(rr.queuePath);
@@ -1872,7 +2001,7 @@ export default {
         description: '人工熔断某任务（--run 指定轮，默认当前轮）',
         execute: async ({ sessionID, prompt }) => {
           const f = parseFlags(prompt.text ?? '');
-          const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+          const runId = cmdRunFor(f, sessionID);
           const id = f.task ?? (prompt.text ?? '').trim();
           const reason = String(f.reason ?? 'manual');
           const r = await haltTask(runId, id, reason, 'human');
@@ -1892,7 +2021,7 @@ export default {
         description: '人工重试已熔断任务（会唤醒 dev；--run 指定轮，默认当前轮）',
         execute: async ({ sessionID, prompt }) => {
           const f = parseFlags(prompt.text ?? '');
-          const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+          const runId = cmdRunFor(f, sessionID);
           const id = f.task ?? (prompt.text ?? '').trim();
           const r = await transition(runId, id, ['halted'], { status: 'dev_doing', assignee: 'dev', retries: 0, reviewRounds: 0 }, { by: 'human', reason: 'retry' });
           if (r.ok) {
@@ -1913,7 +2042,7 @@ export default {
           const reply = (text) => ctx.session.prompt({ sessionID, text });
           try {
             const f = parseFlags(prompt.text ?? '');
-            const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            const runId = cmdRunFor(f, sessionID);
             const id = f.task ?? (prompt.text ?? '').trim();
             const r = await revertTask(runId, id, 'human', f.reason ? String(f.reason) : '');
             if (!r.ok) return reply(r.message);
@@ -1933,7 +2062,7 @@ export default {
           const reply = (text) => ctx.session.prompt({ sessionID, text });
           try {
             const f = parseFlags(prompt.text ?? '');
-            const runId = sanitizeRunId(cmdRun(f) ?? currentRunId());
+            const runId = cmdRunFor(f, sessionID);
             const rawLimit = f.limit ?? f.n ?? '20';
             let limit = 20;
             if (rawLimit !== undefined && rawLimit !== null && String(rawLimit) !== 'true') {
@@ -2002,8 +2131,10 @@ export default {
         name: 'swarm_read_queue',
         description: '读队列（按状态筛选）。做任何动作前先调它确认现状。',
         input: { type: 'object', properties: { status: { type: 'string' }, ...S }, additionalProperties: false },
-        execute: async (input) => {
-          const qp = input?.queue ? abs(cwd, input.queue) : queueFor(input?.run);
+        execute: async (input, toolCtx) => {
+          const runId = runIdForCall(input, toolCtx);
+          // 只读工具不落绑定：无 task_id 时可能退回 current，绑错轮会污染后续解析。
+          const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
           const tasks = loadQueue(qp);
           const filtered = input?.status ? tasks.filter((t) => t.status === input.status) : tasks;
           return { content: JSON.stringify(filtered, null, 2) };
@@ -2019,8 +2150,9 @@ export default {
           required: ['tasks'],
           additionalProperties: false,
         },
-        execute: async (input) => {
-          const runId = sanitizeRunId(input?.run ?? currentRunId());
+        execute: async (input, toolCtx) => {
+          const runId = runIdForCall(input, toolCtx);
+          bindSession(runId, sessionOf(toolCtx, input), 'plan');
           const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
           // 非空轮提示：只提示不拦截，入队语义零变（空轮无提示）。
           let existingCount = 0;
@@ -2029,19 +2161,26 @@ export default {
             existingCount = Array.isArray(prev) ? prev.length : 0;
           } catch { existingCount = 0; }
           const results = [];
+          let enqueued = 0;
           for (const row of input.tasks ?? []) {
             const r = enqueueTask(qp, row, timelineFor(runId), { by: 'plan', reason: 'create' });
+            if (r.ok) enqueued += 1;
             results.push(`${row.id ?? '?'}: ${r.ok ? 'queued' : r.reason}`);
           }
           invalidate(qp);
           // 命名只认显式 name：从「第一个任务标题」猜需求名会把无关的旧任务名带进来
           // （实测污染：上一轮的「永远失败」被当成这一轮的需求名）。
+          // 且**只在本轮真的入队成功后才改名**：10-31 事故里一次全被拒的空入队照样改名，
+          // 把上一轮 round.name / 会话标题洗成了这一轮的需求名（sidebar 两轮同名）。
           const name = oneLine(input.name ?? '', 60);
-          try { ensureRunMeta(cwd, runId, name ? { name } : undefined); } catch { /* best-effort */ }
+          const canName = !!name && enqueued > 0;
+          try { ensureRunMeta(cwd, runId, canName ? { name } : undefined); } catch { /* best-effort */ }
           let nameLine = '';
-          if (name && name !== roundNameFor(runId)) {
+          if (canName && name !== roundNameFor(runId)) {
             const r = await nameRound(name, { run: runId });
             nameLine = `\n本轮命名：**${name}**（已改名 ${r.renamed.length} 个会话${r.errors.length ? `，${r.errors.length} 个失败` : ''}）`;
+          } else if (name && enqueued === 0) {
+            nameLine = '\n⚠️ 本次入队全部被拒：未改名（避免空入队污染本轮需求名）';
           }
           let hintLine = '';
           if (existingCount > 0) {
@@ -2053,11 +2192,17 @@ export default {
 
       editor.add({
         name: 'swarm_claim',
-        description: 'dev 认领任务（queued → dev_doing，CAS 保证不双花）',
-        input: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, ...S }, required: ['task_id'], additionalProperties: false },
-        execute: async (input) => {
-          const runId = sanitizeRunId(input?.run ?? currentRunId());
+        description: 'dev 认领任务（queued → dev_doing，CAS 保证不双花；本轮未 /swarm-start 时拒收）',
+        input: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, force: { type: 'boolean' }, ...S }, required: ['task_id'], additionalProperties: false },
+        execute: async (input, toolCtx) => {
+          // 任务归属优先：子代理就算没带 run、会话也没登记，也能按 task_id 落到正确轮。
+          const runId = runIdForCall(input, toolCtx, input?.task_id);
+          bindSession(runId, sessionOf(toolCtx, input), input.role ?? 'dev');
           const who = input.role ?? 'dev';
+          // P1 start 闸门：up 开的轮在 /swarm-start 之前一律不许认领（并行两轮时否则会先抢跑）。
+          if (isPendingStart(runId) && input.force !== true) {
+            return { content: `⛔ ${START_GATE_HINT}\nrun=${runId}，任务 ${input.task_id} 仍在 queued（确认要绕过加 force:true）` };
+          }
           const r = await transition(runId, input.task_id, 'queued', {
             status: 'dev_doing', assignee: who,
           }, { by: input.as ?? who, reason: 'claim', queue: input?.queue ?? null });
@@ -2066,7 +2211,7 @@ export default {
             // 此时 claim 按 CAS 必败——给可继续信号直接开工，不算认领失败。
             // 他人持有/状态不对仍拒收（sessions 语义零变）。
             try {
-              const qp = input?.queue ? abs(cwd, input.queue) : queueFor(input?.run);
+              const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
               const cur = loadQueue(qp).find((t) => t && t.id === input.task_id);
               if (cur && cur.status === 'dev_doing' && cur.assignee === who) {
                 return { content: `可继续：${cur.id} 已是 dev_doing 且归属 ${who}（属编排预派发，跳过 claim 直接开工）\n验收：${cur.acceptance}\n验证命令：${cur.verify_cmd}` };
@@ -2094,10 +2239,15 @@ export default {
 
       editor.add({
         name: 'swarm_next',
-        description: '取下一个可做任务（dev 轮询用）',
-        input: { type: 'object', properties: { ...S }, additionalProperties: false },
-        execute: async (input) => {
-          const qp = input?.queue ? abs(cwd, input.queue) : queueFor(input?.run);
+        description: '取下一个可做任务（dev 轮询用；本轮未 /swarm-start 时拒收）',
+        input: { type: 'object', properties: { force: { type: 'boolean' }, ...S }, additionalProperties: false },
+        execute: async (input, toolCtx) => {
+          const runId = runIdForCall(input, toolCtx);
+          // 无 task_id：解析可能退回 current，不做会话绑定（防绑错轮）。
+          if (isPendingStart(runId) && input.force !== true) {
+            return { content: `⛔ ${START_GATE_HINT}\nrun=${runId}` };
+          }
+          const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
           const t = loadQueue(qp).find((x) => x.status === 'dev_doing');
           if (!t) return { content: '当前没有 dev_doing 任务。' };
           return { content: JSON.stringify(t, null, 2) };
@@ -2117,8 +2267,9 @@ export default {
           required: ['task_id'],
           additionalProperties: false,
         },
-        execute: async (input) => {
-          const runId = sanitizeRunId(input?.run ?? currentRunId());
+        execute: async (input, toolCtx) => {
+          const runId = runIdForCall(input, toolCtx, input?.task_id);
+          bindSession(runId, sessionOf(toolCtx, input), 'dev');
           const qIn = input?.queue ?? null;
           const qp = qIn ? abs(cwd, input.queue) : queueFor(runId);
           const task = loadQueue(qp).find((t) => t.id === input.task_id);
@@ -2224,8 +2375,9 @@ export default {
           required: ['task_id', 'pass'],
           additionalProperties: false,
         },
-        execute: async (input) => {
-          const runId = sanitizeRunId(input?.run ?? currentRunId());
+        execute: async (input, toolCtx) => {
+          const runId = runIdForCall(input, toolCtx, input?.task_id);
+          bindSession(runId, sessionOf(toolCtx, input), 'test');
           const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
           const task = loadQueue(qp).find((t) => t.id === input.task_id);
           if (!task) return { content: `任务不存在：${input.task_id}` };
@@ -2322,8 +2474,9 @@ export default {
           required: ['task_id', 'verdict'],
           additionalProperties: false,
         },
-        execute: async (input) => {
-          const runId = sanitizeRunId(input?.run ?? currentRunId());
+        execute: async (input, toolCtx) => {
+          const runId = runIdForCall(input, toolCtx, input?.task_id);
+          bindSession(runId, sessionOf(toolCtx, input), 'reviewer');
           const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
           const task = loadQueue(qp).find((t) => t.id === input.task_id);
           if (!task) return { content: `任务不存在：${input.task_id}` };
@@ -2418,8 +2571,9 @@ export default {
           required: ['task_id'],
           additionalProperties: false,
         },
-        execute: async (input) => {
-          const runId = sanitizeRunId(input?.run ?? currentRunId());
+        execute: async (input, toolCtx) => {
+          const runId = runIdForCall(input, toolCtx, input?.task_id);
+          bindSession(runId, sessionOf(toolCtx, input), 'human');
           const id = String(input?.task_id ?? '').trim();
           const reason = input?.reason !== undefined ? String(input.reason) : 'manual';
           const r = await haltTask(runId, id, reason, 'human');
@@ -2442,8 +2596,9 @@ export default {
           required: ['task_id'],
           additionalProperties: false,
         },
-        execute: async (input) => {
-          const runId = sanitizeRunId(input?.run ?? currentRunId());
+        execute: async (input, toolCtx) => {
+          const runId = runIdForCall(input, toolCtx, input?.task_id);
+          bindSession(runId, sessionOf(toolCtx, input), 'human');
           const id = String(input?.task_id ?? '').trim();
           const r = await revertTask(runId, id, 'human', input?.reason ? String(input.reason) : '');
           if (!r.ok) return { content: r.message };
@@ -2463,7 +2618,8 @@ export default {
           additionalProperties: false,
         },
         execute: async (input, toolCtx) => {
-          const runId = sanitizeRunId(input?.run ?? currentRunId());
+          const runId = runIdForCall(input, toolCtx, input?.task_id);
+          bindSession(runId, sessionOf(toolCtx, input), 'human');
           const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
           const id = String(input?.task_id ?? '').trim();
           if (!id || id === 'true') return { content: '用法：swarm_approve {task_id: "<id>"}（仅 high-risk 任务可批）' };
@@ -2507,8 +2663,8 @@ export default {
           required: [],
           additionalProperties: false,
         },
-        execute: async (input) => {
-          const c = readConfig(input?.run);
+        execute: async (input, toolCtx) => {
+          const c = readConfig(runIdForCall(input, toolCtx));
           return { content: JSON.stringify(c, null, 2) };
         },
       });

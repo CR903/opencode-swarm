@@ -40,8 +40,8 @@
 在主会话直接说人话，`swarm-orchestrate` skill 全程代跑，
 只在要拍板 / 出事时找你：
 
-- "登录页背景换成深蓝渐变" → 新需求：skill 拆任务 → `swarm_plan` 批量 → 按 wave 派 subagent。
-- "W1-T1 挂了，再修一下" → bugfix：`swarm_read_queue` 找命中则复用，否则建单任务 → dev 会话直接开工（wake 已投递，带验收 + `verify_cmd` + 上次失败史）→ 修完走 `subagent(test)` → 验收通过主会话调 `/swarm-clean` 归档（人不敲命令）。
+- "登录页背景换成深蓝渐变" → 新需求：skill 拆任务 → `swarm_plan` 批量 → **`/swarm-start`** 派发 → 按 wave 派 subagent。
+- "W1-T1 挂了，再修一下" → bugfix：`swarm_read_queue` 找命中则复用，否则建单任务 → **`/swarm-start`** 派发 → dev 会话开工（带验收 + `verify_cmd` + 上次失败史）→ 修完走 `subagent(test)` → 验收通过主会话调 `/swarm-clean` 归档（人不敲命令）。
 - "W1-T1 再测一遍" → 复测：派 `subagent(test)`（带 `verify_cmd` + 边界）。
 - "现在啥情况" → 进度：读队列 + timeline，回一句话。
 - "别跑了 / 回滚重来" → 叫停：`swarm_halt` 熔断，要重做再 `swarm_revert`。
@@ -49,7 +49,7 @@
 循环 recipe（伪代码级）：
 
 ```
-swarm_read_queue 看现状 → 分类意图 → plan/派 dev会话或subagent → 轮询直到 drained 或 HALT → 验收通过主会话调 /swarm-clean 归档（人不敲命令）→ 汇报
+swarm_read_queue 看现状 → 分类意图 → plan → /swarm-start 派发 → dev会话或subagent → 轮询直到 drained 或 HALT → 验收通过主会话调 /swarm-clean 归档（人不敲命令）→ 汇报
 ```
 
 完整 recipe（含 prompt 模板、模型映射、三铁律）见 skill
@@ -100,7 +100,9 @@ node --test .opencode/lib/swarm.test.mjs .opencode/plugins/swarm.e2e.test.mjs
   --name            待办角标刷新
 ```
 
-三个模型会**先校验再建会话**。写错时一个会话都不会建，并直接告诉你错在哪、正确写法是什么：
+三个模型会**先校验再建会话**。默认口径是 **plan = 主会话**（`/swarm-up` 只看 dev/test 的模型，
+plan 用发起命令的这个会话），所以正常只建 dev（hybrid）或 dev+test（sessions）。写错时一个会话都不会建，
+并直接告诉你错在哪、正确写法是什么：
 
 ```
 ❌ /swarm-up 未创建任何会话 —— 模型不可用
@@ -119,7 +121,7 @@ node --test .opencode/lib/swarm.test.mjs .opencode/plugins/swarm.e2e.test.mjs
 /swarm-models --provider opencode-go   # 只列某个 provider
 ```
 
-`--name` 之后，三个会话的标题就是 `需求名` / `需求名 · dev` / `需求名 · test`；
+`--name` 之后，主会话标题就是 `需求名`，另建的 dev/test 是 `需求名 · dev` / `需求名 · test`；
 不写 `--name` 也行 —— 在 planner 里敲 `#plan <需求>` 时会自动按需求改名
 （多开几轮 swarm 也能一眼分清）。
 
@@ -151,7 +153,7 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 
 拿到答案后重跑带参 `/swarm-up --run <空轮runId> --planner-model <p> --dev-model <d> --tester-model <t> --name <需求名>`
 （复用本空轮，不会再派生新轮；开场卡内已给出可复制的一条），
-然后在 planner 会话里 `#plan 拆解 <需求>`。仅模型 flag（`--planner-model` / `--dev-model` / `--tester-model` / `--reviewer-model`，裸写 `<modelKey>` 亦算）或 `--executor` 算实质 flag，有任一即走老行为直接建会话；单 `--name`（无任何模型/执行器 flag）不跳卡，仍回开场卡并回显已预填的需求名（空轮已建，见上一段）。
+然后回到**当前会话**（默认它就是 planner）`#plan 拆解 <需求>`；要另建 plan 会话加 `--plan-session new`。仅模型 flag（`--planner-model` / `--dev-model` / `--tester-model` / `--reviewer-model`，裸写 `<modelKey>` 亦算）或 `--executor` 算实质 flag，有任一即走老行为直接建会话；单 `--name`（无任何模型/执行器 flag）不跳卡，仍回开场卡并回显已预填的需求名（空轮已建，见上一段）。
 
 ---
 
@@ -161,9 +163,9 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 > 需求：库管在「瓶子记录列表」的编辑弹窗和 Excel 批量修改里，补录**开瓶日期 / 开瓶人 / 开瓶有效期(月)**；
 > 首次补录要写 `OpOpen` 流水并把 `state` 推到 2，非首次只写 `OpEdit`，`state` 不变。
 
-### 第 ① 步：planner 拆任务（会话 A）
+### 第 ① 步：planner 拆任务（默认就是主会话）
 
-在 planner 会话里敲：
+在主会话里敲（`/swarm-up` 默认把主会话登记为 planner；旧的独立 plan 会话需 `--plan-session new`）：
 
 ```
 #plan 拆解 .trellis/tasks/archive/2026-10/10-20-bottle-open-info-edit/
@@ -191,18 +193,21 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 - 有没有任务混了多件事？`W1-T2` 若同时含"写流水"和"改 Excel"，就该拆开。
 - 有没有任务的 acceptance 是"代码正确"这种无法判定的废话？有就让 planner 重写。
 
-### 第 ② 步：启动流水线（任意会话）
+### 第 ② 步：启动流水线（必须显式 start）
 
 ```
 /swarm-start
 ```
+
+> `/swarm-up` 只开轮**不派发**；plan 入队后如果不 start，dev/test 的 `swarm_claim/swarm_next` 会被闸门拒收
+> （提示「本轮已 plan 未派发」）。这是为了杜绝「没 start 就被子代理抢跑」。
 
 输出：`已派发 W1-T1（wave=W1）→ dev` + `已唤醒 ses_xxx（dev）→ 该会话开始执行 W1-T1`。
 队列里 `W1-T1` 变 `dev_doing`，通道里出现 `[TASK-ASSIGN] task=W1-T1 ... to=dev`，
 **dev 会话同时被唤醒开始干活**（不会再出现「派发了但没人动」的悬空状态）。
 
 想换需求名，可以在这一步补：`/swarm-start --name 瓶子开瓶信息补录`，
-当前会话和三个角色会话会一起改名。
+当前会话和角色会话会一起改名。
 
 ### 第 ③ 步：dev 干活（会话 B）
 

@@ -62,7 +62,9 @@ tag 由插件的 `session.prompt` hook 展开：角色契约 + 任务详情 + �
    同 ID 在别的 provider 下存在 → 直接给「你是不是想用」（覆盖 `OpenCode`→`opencode-go`、`Opencodel` 这类拼错）；
 3. **任何一个不合法 → 一个会话都不建**，输出里逐条列出角色/原因/建议；
 4. 合法才 `session.create({ title, agent, model })`，然后 `session.get` **回读核对**模型与 agent；
-5. 台账落 `.swarm/runs/<runId>/round.json`（`name` + 三角色 sessionID）。
+5. 台账落 `.swarm/runs/<runId>/round.json`（`name` + 三角色 sessionID + `members` 动态成员）。
+   默认 **plan = 发起 `/swarm-up` 的主会话**（`sessions.plan`/`members[host]` 都指向它，不另建 plan 会话）；
+   `--plan-session new` 恢复「另建 plan 会话」。
 
 **命名**：`--name` 或 `#plan <需求>` 触发 `nameRound()`：主会话用纯需求名，
 其余角色 `需求名 · dev` / `需求名 · test`；`title` hook 拦掉 OpenCode 的自动标题，避免被改成猜出来的短句。
@@ -168,4 +170,32 @@ bun build .opencode/tui/swarm-board.tsx --external @opencode/plugin --external @
   **需求命名**（`#plan` / `--name` / title hook）、**派发可见性**（start 唤醒 dev、done 唤醒 test、
   无台账时如实提示）、**R1 必填**、**R2 开关**、**R3 base 竞态**、**R4 revert**、
   **R5+R6 disposition 与 HALT 摘要**、**R7 nightly 只读重跑**、
-  **Reviewer-N1 全闭环**（review=false 零变直通 + approve 直过 + verdict/关闭校验拒收 + request-changes 修后过 + reviewRounds 上限 HALT）。
+  **Reviewer-N1 全闭环**（review=false 零变直通 + approve 直过 + verdict/关闭校验拒收 + request-changes 修后过 + reviewRounds 上限 HALT）、
+  **并行两轮隔离 / start 闸门 / 空入队不改名**（P0/P1，见 §10）。
+
+## 10. 并行多轮隔离与派发授权（2026-11-02）
+
+> 事故：同时开两个需求（两个主会话），第二个 `/swarm-up` 把全局 `.swarm/current` 指到新轮，
+> 第一个主会话随后的 `#plan` / `swarm_plan` / `swarm_claim` 全落到新轮 —— 串队列、串改名、
+> 空的入队调用还把新轮需求名写到了旧轮（sidebar 两轮同名）；主会话绕过 planner 自行猜需求，
+> 未 `/swarm-start` 就派子代理开工；footer 永远停在 current（主会话/子代理不在 round.sessions 里）。
+
+**不变量：**
+
+1. **run 解析优先级**（`resolveRun`，唯一入口）：
+   显式 `run` > `cfg.runId` > **任务归属（带 task_id 时）** > **会话绑定** > `.swarm/current` > `default`。
+   - 会话绑定来源：`round.json` 的 `sessions`（角色会话）+ `members`（主会话 host / 子代理 / 任意调过工具的会话）。
+   - `.swarm/current` 只是兜底：并行多轮时不得作为唯一依据。
+2. **主会话即 planner（默认）**：`/swarm-up` 把调用者 sid 登记为 `sessions.plan` + `members[host]`，
+   不再另建 plan 会话；`--plan-session new` 保留旧行为。同一会话开新轮时自动从旧轮摘除（一个会话只属一轮）。
+3. **派发授权**：`/swarm-up` 写 `meta.pendingStart=true`（从未 start 过的轮）；`/swarm-start` 写
+   `startedAt` 并清 `pendingStart`。`swarm_claim` / `swarm_next` 在 `pendingStart=true` 时拒收（逃生口 `force:true`）；
+   已 start 的轮重跑 up 不重新上锁。
+4. **命名一致性**：`round.name` 与 `meta.name` 由 `writeRoundFor` 同步双写；`swarm_plan` 只在
+   **至少一条任务真的入队成功**后才改名（空入队不再污染轮名）。sidebar 以 `meta.name` 为规范名。
+5. **跟随**：`sessionRunIndex` 读 `sessions` + `members`，footer / sidebar 高亮按会话命中，未命中才回退 current。
+
+**回归锁：** `tests/swarm.test.mjs`（resolveRun 优先级、writeRound members）、
+`tests/swarm.e2e.test.mjs`（「P0/P1 编排闸门」5 例：并行两轮、members 登记、start 闸门、空入队不改名、会话换轮）、
+`tests/swarm-board-data.test.mjs`（members 索引、meta 名字优先）。
+

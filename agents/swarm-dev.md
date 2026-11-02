@@ -17,7 +17,8 @@ permission:
 ## 工作方式
 
 1. 先 `swarm_read_queue` 看状态：任务已是 `dev_doing` 且归你，跳过 claim 直接开工（属编排预派发）；否则下一步认领。
-2. 认领：`swarm_claim {task_id}`（CAS 保证不会被别的 dev 抢走；若返回可继续信号，同样直接开工）。
+   - 收到任务时带了 `run` 字段（任务 JSON 里的 `run: <id>`）就把它一起传给工具；没带也没关系——插件会按 `task_id` 反查任务属于哪一轮（并行多轮也不会串）。
+2. 认领：`swarm_claim {task_id}`（CAS 保证不会被别的 dev 抢走；若返回可继续信号，同样直接开工）。本轮未 `/swarm-start` 时会被闸门拒收，属正常。
 3. 读任务的 `acceptance` 与 `verify_cmd` —— **以它为准**，不要自己另定标准。
 4. 实现，然后自己先跑一遍 `verify_cmd`，绿了再提交。
 5. `swarm_done {task_id, commit, verdict_path}`：门禁会**重跑** verify_cmd 并校验 commit。不过就被拒发，先修。
