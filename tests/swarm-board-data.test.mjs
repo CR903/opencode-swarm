@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import {
   readRunSnapshot, funnelCounts, sessionRows, healthJudgement, formatElapsed,
   findingsByTask, executorOf, approvalsByTask, pendingApprovals,
-  listRunSummaries, sessionRunIndex, resolveFooterRun,
+  listRunSummaries, sessionRunIndex, resolveFooterRun, shouldShowBoard,
 } from '../lib/swarm-board-data.mjs';
 
 let dir;
@@ -468,8 +468,8 @@ describe('resolveFooterRun：三路', () => {
     assert.equal(resolveFooterRun('ses_test_b', index, 'run-a'), 'run-b');
   });
 
-  test('未注册会话 fallback current（现状保留）', () => {
-    assert.equal(resolveFooterRun('ses_unknown', index, 'run-a'), 'run-a');
+  test('未注册会话不透视（别轮隐藏，不回 current）', () => {
+    assert.equal(resolveFooterRun('ses_unknown', index, 'run-a'), null);
   });
 
   test('空 sessionID 回 current；current 空原样回', () => {
@@ -477,5 +477,33 @@ describe('resolveFooterRun：三路', () => {
     assert.equal(resolveFooterRun('', index, 'run-a'), 'run-a');
     assert.equal(resolveFooterRun('ses_dev_a', index, null), 'run-a', '命中时 current 空亦回命中');
     assert.equal(resolveFooterRun('ses_unknown', index, null), null);
+  });
+});
+
+describe('shouldShowBoard：别轮隐藏（sidebar 整卡 + footer 共用判据）', () => {
+  const index = {
+    ses_dev_a: { runId: 'run-a', role: 'dev' },
+    ses_host_b: { runId: 'run-b', role: 'host' },
+  };
+
+  test('命中索引展示（含 host 成员）', () => {
+    assert.equal(shouldShowBoard('ses_dev_a', index), true);
+    assert.equal(shouldShowBoard('ses_host_b', index), true, '主会话 host 在索引里即展示');
+  });
+
+  test('sid 非空未命中隐藏', () => {
+    assert.equal(shouldShowBoard('ses_unknown', index), false);
+    assert.equal(shouldShowBoard('ses_unknown', {}), false, '空索引同样隐藏（不断流的是未知 sid，不是未登记）');
+  });
+
+  test('sid 为空不断流（未知上下文 fail-open）', () => {
+    assert.equal(shouldShowBoard(null, index), true);
+    assert.equal(shouldShowBoard('', index), true);
+    assert.equal(shouldShowBoard(undefined, index), true);
+  });
+
+  test('坏输入不断流', () => {
+    assert.equal(shouldShowBoard('ses_x', null), true);
+    assert.equal(shouldShowBoard('ses_x', undefined), true);
   });
 });

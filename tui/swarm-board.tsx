@@ -19,6 +19,7 @@ import {
   listRunSummaries,
   sessionRunIndex,
   resolveFooterRun,
+  shouldShowBoard,
   sessionRows,
   healthJudgement,
   formatElapsed,
@@ -601,6 +602,13 @@ export default Plugin.define({
           </box>
         );
       }
+      // 未登记会话不透视：sid 非空但不在任何轮索引里 → 整卡隐藏（别轮会话不再看到本轮）。
+      // sid 为空（未知上下文）或索引读取失败 → 不断流（fail-open）。
+      try {
+        if (!shouldShowBoard(currentSid(), runIdx())) return null;
+      } catch {
+        /* fail-open：读索引失败不断流 */
+      }
       const f = funnel();
       const r = rtp();
       const stale = () => !snap().ok;
@@ -690,7 +698,7 @@ export default Plugin.define({
 
     function FooterLine(props: { sessionID?: string }) {
       if (isEmpty()) return null;
-      // 跟随所在会话：命中索引只渲染该 run；未注册回退 current（现状）；current 空沿用隐藏。
+      // 跟随所在会话：命中索引只渲染该 run；sid 非空未注册整卡隐藏（别轮不透视）；sid 为空不断流。
       let target: string | null = null;
       try {
         target = resolveFooterRun(props.sessionID, runIdx(), snap().runId || null);
