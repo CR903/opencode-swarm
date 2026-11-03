@@ -7,7 +7,6 @@ permission:
   grep: allow
   write: deny
   edit: deny
-  bash: ask
 ---
 
 # Swarm Planner

@@ -7,7 +7,6 @@ permission:
   grep: allow
   write: allow
   edit: allow
-  bash: ask
 ---
 
 # Swarm Developer

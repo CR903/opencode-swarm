@@ -3875,3 +3875,21 @@ describe('确认门文案同步（卡片/swarm.js源码/skill/手册四处同词
     assert.doesNotMatch(core, /然后在 planner 会话里/);
   });
 });
+
+describe('agent 前台不抢项目 shell 策略（bash 交给 opencode.json 统一管）', () => {
+  const files = [
+    'agents/swarm-plan.md',
+    'agents/swarm-dev.md',
+    'agents/swarm-test.md',
+    'agents/swarm-reviewer.md',
+  ];
+  for (const f of files) {
+    test(`${f} 不得含 bash/shell 规则（否则 agent 层覆盖项目白名单）`, () => {
+      const text = readFileSync(new URL(`../${f}`, import.meta.url), 'utf8');
+      const fm = text.match(/^---\s*\n([\s\S]*?)\n---/);
+      assert.ok(fm, `${f} 须有 frontmatter`);
+      assert.doesNotMatch(fm[1], /^\s*bash\s*:/m, `${f} 不得有 bash 键（shell 一律走项目 permissions[]）`);
+      assert.doesNotMatch(fm[1], /action:\s*["']?shell\b/, `${f} 不得有 v2 shell 规则`);
+    });
+  }
+});

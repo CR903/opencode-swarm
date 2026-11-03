@@ -7,7 +7,6 @@ permission:
   grep: allow
   write: deny
   edit: deny
-  bash: allow
 ---
 
 # Swarm Tester
