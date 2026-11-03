@@ -2421,6 +2421,19 @@ describe('无参 /swarm-up 提问式开场卡（零会话零落盘零队列读�
     assert.match(dr, /drained/);
   });
 
+  test('开场卡双路径：确认门问句 + 主会话措辞（无 planner 会话）', async () => {
+    const bare = await cmdU('swarm-up', '');
+    assert.match(bare, /是否开始 planner？/);
+    assert.match(bare, /主会话即 planner/);
+    assert.match(bare, /不要自行开始分析需求/);
+    assert.doesNotMatch(bare, /然后在 planner 会话里/);
+    const named = await cmdU('swarm-up', '--name 确认门卡片');
+    assert.match(named, /是否开始 planner？/);
+    assert.match(named, /主会话即 planner/);
+    assert.match(named, /不要自行开始分析需求/);
+    assert.doesNotMatch(named, /然后在 planner 会话里/);
+  });
+
   test('显式 --run 无名建空轮：同回开场卡不派生新轮，落盘可辨非 STALE', async () => {
     const nBefore = createCount;
     const out = await cmdU('swarm-up', '--run 显式空轮B');
@@ -3828,5 +3841,37 @@ describe('P0/P1 编排闸门（并行两轮隔离 / start 授权 / 空入队不�
     assert.ok(!readRoundOf('需求B').members?.['hostB'], '旧轮 members 不得留 hostB');
     assert.ok(!Object.values(readRoundOf('需求B').sessions).includes('hostB'), '旧轮 sessions 不得留 hostB');
     assert.equal(readRoundOf('需求C').sessions.plan, 'hostB', '新轮 hostB 即 planner');
+  });
+});
+
+describe('确认门文案同步（卡片/swarm.js源码/skill/手册四处同词）', () => {
+  const skill = readFileSync(new URL('../skills/swarm-orchestrate/SKILL.md', import.meta.url), 'utf8');
+  const manual = readFileSync(new URL('../docs/swarm-使用手册.md', import.meta.url), 'utf8');
+  const core = readFileSync(new URL('../plugins/swarm.js', import.meta.url), 'utf8');
+  const G1 = '是否开始 planner？';
+  const G2 = '是否 /swarm-start 派发？';
+
+  test('skill 含两道门问句原文', () => {
+    assert.ok(skill.includes(G1), 'skill 须含门一问句');
+    assert.ok(skill.includes(G2), 'skill 须含门二问句');
+    assert.ok(skill.includes('不要自行开始分析需求'), 'skill 须禁自行分析');
+  });
+
+  test('skill 已删旧口径（小活直接派/主会话代跑）', () => {
+    assert.doesNotMatch(skill, /≤3 且无 high-risk 可直接派/);
+    assert.doesNotMatch(skill, /或主会话代跑/);
+  });
+
+  test('手册含两道门问句原文', () => {
+    assert.ok(manual.includes(G1), '手册须含门一问句');
+    assert.ok(manual.includes(G2), '手册须含门二问句');
+  });
+
+  test('手册已删旧口径', () => {
+    assert.doesNotMatch(manual, /≤3 且无 high-risk 可直接派/);
+  });
+
+  test('swarm.js 卡片无 planner 会话旧措辞', () => {
+    assert.doesNotMatch(core, /然后在 planner 会话里/);
   });
 });

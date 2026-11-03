@@ -52,7 +52,7 @@
 swarm_read_queue 看现状 → 分类意图 → plan → /swarm-start 派发 → dev会话或subagent → 轮询直到 drained 或 HALT → 验收通过主会话调 /swarm-clean 归档（人不敲命令）→ 汇报
 ```
 
-完整 recipe（含 prompt 模板、模型映射、三铁律）见 skill
+完整 recipe（含 prompt 模板、模型映射、四铁律）见 skill
 `.opencode/skills/swarm-orchestrate/SKILL.md`；
 执行器细节与判活 fence 见 §9（附录，编排循环 recipe 原文仍在那里，
 与 `/swarm-mode` 输出逐字一致，改文案先改 `swarm.js` 的 `DRAINED_RECIPE`）；
@@ -619,7 +619,7 @@ loop:
 dev 常驻会话直接开工（wake已投递；任务已是 dev_doing 且归自己时跳过 claim 直接开工，claim 返回"可继续"时同样直接开工）。test/reviewer 子代理流程不变。
 high-risk 任务派 subagent 前先查 approve 行（swarm_read_queue 看 timeline 或 status 待批行），无批不派。
 
-确认门（大活先公示再派）：`swarm_plan` 拆完后，若任务数>3 或含 high-risk（阈值写死，不做配置项），先输出任务映射表（任务 id/标题/risk/verify_cmd 一览），等人回"可以派"再派 dev 会话/test 子代理；≤3 且无 high-risk 可直接派。
+确认门（两道，缺一不可，不代跑）：门一，开轮（空轮/新轮、队列为空）后先问用户「是否开始 planner？（#plan 输入具体需求/探索，分解成任务）」，得到确认才拆解；门二，`swarm_plan` 入队后一律输出任务映射表（任务 id/标题/risk/verify_cmd 一览），再问用户「是否 /swarm-start 派发？」，得到确认才派发；大小活一视同仁，原来“≤3 直接派”作废。
 
 review 开的任务（medium/high 默认进评审，low 默认直通，显式 review 优先）test pass 后派 reviewer subagent（agent=swarm-reviewer）；standard 分两轮：第二轮 prompt 附第一轮 findings 全列为 excluded；N1 去重：同 file+line+rule 合并一句（冲突留两条）。
 
