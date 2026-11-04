@@ -758,13 +758,39 @@ describe('up 新轮隔离（无 --run 派生，不串旧轮）', () => {
     assert.equal(bytes3(join(dir3, '.swarm/current')).trim(), 'default', '显式 --run 认领当前轮（老行为）');
   });
 
-  test('派生冲突自动加 -2 后缀，旧同名轮不动', async () => {
+  test('同名非空轮默认问复用还是新开（零落盘，不派生 -2）', async () => {
+    const seed = await run3('swarm_plan', {
+      run: '库房列表库存显示',
+      tasks: [{ id: 'DUP-T1', wave: 'W1', stack: 'backend', title: '占位任务', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false }],
+    });
+    assert.match(seed, /DUP-T1: queued/);
     const snap = bytes3(join(dir3, '.swarm/runs/库房列表库存显示/round.json'));
-    const out = await cmd3('swarm-up', '--executor sessions --name 库房列表库存显示');
+    const curBefore = bytes3(join(dir3, '.swarm/current')).trim();
+    const out = await cmd3('swarm-up', '--name 库房列表库存显示');
+    assert.match(out, /同名轮已存在/);
+    assert.match(out, /复用旧轮/);
+    assert.match(out, /--new/);
+    assert.equal(bytes3(join(dir3, '.swarm/current')).trim(), curBefore, '二选一卡零落盘：不动 current');
+    assert.ok(!existsSync(join(dir3, '.swarm/runs/库房列表库存显示-2')), '不得静默派生 -2 目录');
+    assert.equal(bytes3(join(dir3, '.swarm/runs/库房列表库存显示/round.json')), snap, '旧同名轮原封不动');
+  });
+
+  test('同名非空轮 --new 照旧派生 -2（显式新开意图）', async () => {
+    const snap = bytes3(join(dir3, '.swarm/runs/库房列表库存显示/round.json'));
+    const out = await cmd3('swarm-up', '--name 库房列表库存显示 --new');
     assert.match(out, /## swarm-up/);
     assert.equal(bytes3(join(dir3, '.swarm/current')).trim(), '库房列表库存显示-2');
-    assert.ok(existsSync(join(dir3, '.swarm/runs/库房列表库存显示-2/round.json')), '冲突轮应落 -2 目录');
+    assert.ok(existsSync(join(dir3, '.swarm/runs/库房列表库存显示-2/round.json')), '显式 --new 应落 -2 目录');
     assert.equal(bytes3(join(dir3, '.swarm/runs/库房列表库存显示/round.json')), snap, '旧同名轮原封不动');
+  });
+
+  test('同名空轮静默复用（零任务不 spawns -2 目录）', async () => {
+    const mk = await cmd3('swarm-up', '--run 空复用轮 --name 空复用需求');
+    assert.match(mk, /空轮已建/);
+    const out = await cmd3('swarm-up', '--name 空复用需求');
+    assert.match(out, /空轮已建|轮已复用/);
+    assert.ok(!existsSync(join(dir3, '.swarm/runs/空复用需求-2')), '空轮复用不得 spawns -2 目录');
+    assert.equal(bytes3(join(dir3, '.swarm/current')).trim(), '空复用需求');
   });
 
   test('显式 --run 指空轮放行（老行为零变）', async () => {
@@ -2547,6 +2573,24 @@ describe('无参 /swarm-up 提问式开场卡（零会话零落盘零队列读�
     assert.equal(createCount - nBefore, 1, '默认 hybrid：plan 用主会话，只建 dev 一个会话');
   });
 
+  test('分栈模型按需建 dev 常驻会话（backend 优先，legacy 通配亦可）', async () => {
+    const nBefore = createCount;
+    const out = await cmdU('swarm-up', '--run 按需建会话 --name 按需建会话 --dev-backend-model opencode-go/deepseek-v4.1-flash');
+    assert.match(out, /- dev .*opencode-go\/deepseek-v4\.1-flash/);
+    assert.equal(createCount - nBefore, 1, '只建 dev 一个会话（plan=本会话，test 走子代理）');
+    const meta = JSON.parse(readFileSync(join(dirU, '.swarm/runs/按需建会话/meta.json'), 'utf8'));
+    assert.equal(meta.roleModels.dev_backend, 'opencode-go/deepseek-v4.1-flash');
+    const round = JSON.parse(readFileSync(join(dirU, '.swarm/runs/按需建会话/round.json'), 'utf8'));
+    assert.ok(typeof round.sessions.dev === 'string' && round.sessions.dev, 'dev 常驻会话应登记进台账');
+  });
+
+  test('只给 frontend 模型同样建 dev 会话（取 frontend 值）', async () => {
+    const out = await cmdU('swarm-up', '--run 按需建会话F --name 按需建会话F --dev-frontend-model opencode-go/muse-spark-1.3-contributor');
+    assert.match(out, /- dev .*opencode-go\/muse-spark-1\.3-contributor/);
+    const round = JSON.parse(readFileSync(join(dirU, '.swarm/runs/按需建会话F/round.json'), 'utf8'));
+    assert.ok(typeof round.sessions.dev === 'string' && round.sessions.dev, 'dev 常驻会话应登记进台账');
+  });
+
   test('显式 --executor subagents 不建会话（plan=主会话，dev/test 走子代理）', async () => {
     const nBefore = createCount;
     const out = await cmdU('swarm-up', '--name 子代理回退 --dev-model opencode-go/deepseek-v4.1-flash --executor subagents');
@@ -3310,6 +3354,41 @@ describe('高风险软卡 approve（10-30-swarm-approve-softcard，五例锁死�
     assert.equal(qRowsA().find((t) => t.id === 'H-AP1').status, 'dev_doing', '批后派发照常流转');
   });
 
+  test('批量放行：task_ids 一次批多单，各写一行（原子：全验后写）', async () => {
+    await runA('swarm_plan', {
+      tasks: [
+        { id: 'H-B1', wave: 'W1', stack: 'backend', title: '批量一', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', review: false },
+        { id: 'H-B2', wave: 'W1', stack: 'backend', title: '批量二', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', review: false },
+      ],
+    });
+    const nBefore = tlRowsA().filter((r) => r.kind === 'approve').length;
+    const out = await runA('swarm_approve', { task_ids: ['H-B1', 'H-B2'], as: 'batch-man' });
+    assert.match(out, /已批准 H-B1/);
+    assert.match(out, /已批准 H-B2/);
+    assert.equal(tlRowsA().filter((r) => r.kind === 'approve').length, nBefore + 2, '批量各写一行');
+  });
+
+  test('批量原子：混入非 high 整批拒收、零写行', async () => {
+    await runA('swarm_plan', {
+      tasks: [
+        { id: 'H-B3', wave: 'W1', stack: 'backend', title: '批量三', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', review: false },
+        { id: 'M-B4', wave: 'W1', stack: 'backend', title: '中风险', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'medium', review: false },
+      ],
+    });
+    const nBefore = tlRowsA().filter((r) => r.kind === 'approve').length;
+    const out = await runA('swarm_approve', { task_ids: ['H-B3', 'M-B4'] });
+    assert.match(out, /批量拒收/);
+    assert.match(out, /M-B4/);
+    assert.equal(tlRowsA().filter((r) => r.kind === 'approve').length, nBefore, '整批拒收零写行（含 H-B3 也不得写）');
+    const miss = await runA('swarm_approve', { task_ids: ['H-B3', 'NOPE-X'] });
+    assert.match(miss, /批量拒收/);
+    assert.match(miss, /NOPE-X/);
+    assert.equal(tlRowsA().filter((r) => r.kind === 'approve').length, nBefore, '缺失 id 同样整批拒收');
+    // 收尾：H-B3 照批（共享队列不给下游留未批 high，M-B4 非 high 永不 pending）
+    const clean = await runA('swarm_approve', { task_ids: ['H-B3'] });
+    assert.match(clean, /已批准 H-B3/);
+  });
+
   test('重复批幂等：第二次返回已批且 timeline 仍一行；rebuild 干跑一致（approve 重放忽略）', async () => {
     const again = await runA('swarm_approve', { task_id: 'H-AP1', as: 'approver-1' });
     assert.match(again, /已批/);
@@ -4035,6 +4114,30 @@ describe('按需模型门禁（start 硬拦：只索要实际 stack，不靠主�
     assert.ok(Array.isArray(cfg.validStacks) && cfg.validStacks.includes('integration'), '合法 stack 枚举透出');
   });
 
+  test('空轮建议：显示名撞车时指到非空候选轮（零落盘）', async () => {
+    await cmdG('swarm-up', '--run SHELL --name 外壳');
+    await cmdG('swarm-up', '--run SHELL-2 --name 外壳');
+    await runG('swarm_plan', {
+      run: 'SHELL-2',
+      tasks: [{ id: 'SH-T1', wave: 'W1', stack: 'backend', title: '候选任务', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false }],
+    });
+    const curBefore = existsSync(join(dirG, '.swarm/current')) ? readFileSync(join(dirG, '.swarm/current'), 'utf8') : null;
+    const out = await cmdG('swarm-start', '--run SHELL');
+    assert.match(out, /队列已空/);
+    assert.match(out, /SHELL-2/);
+    assert.match(out, /1 个任务/);
+    assert.match(out, /runId 与显示名不是一回事/);
+    const curAfter = existsSync(join(dirG, '.swarm/current')) ? readFileSync(join(dirG, '.swarm/current'), 'utf8') : null;
+    assert.equal(curAfter, curBefore, '建议早回：不动 current（零落盘）');
+  });
+
+  test('空轮无候选走老路（纯空轮仍报队列已空）', async () => {
+    await cmdG('swarm-up', '--run LONELY --name 孤轮');
+    const out = await cmdG('swarm-start', '--run LONELY');
+    assert.match(out, /队列已空/);
+    assert.doesNotMatch(out, /同名显示名/, '无候选不画蛇添足');
+  });
+
   test('plan prd 透传：meta 记 prdPath 备查', async () => {
     const out = await runG('swarm_plan', {
       run: 'GATEPRD',
@@ -4045,4 +4148,17 @@ describe('按需模型门禁（start 硬拦：只索要实际 stack，不靠主�
     assert.match(out, /PRD：docs\/prd\/demo\.md/);
     assert.equal(JSON.parse(readFileSync(mFile('GATEPRD'), 'utf8')).prdPath, 'docs/prd/demo.md');
   });
+
+  test('#4 归属可视化：claim/done 回执带 run=（越界派单一看便知）', async () => {
+    const p = await runG('swarm_plan', {
+      run: 'GATEVIS',
+      tasks: [{ id: 'GV-T1', wave: 'W1', stack: 'backend', title: '可视化', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false }],
+    });
+    assert.match(p, /GV-T1: queued/);
+    const c = await runG('swarm_claim', { run: 'GATEVIS', task_id: 'GV-T1', role: 'dev' });
+    assert.match(c, /run=GATEVIS · 已认领 GV-T1/);
+    const d = await runG('swarm_done', { run: 'GATEVIS', task_id: 'GV-T1', summary: '做完' });
+    assert.match(d, /run=GATEVIS · ✅ 门禁通过/);
+  });
 });
+

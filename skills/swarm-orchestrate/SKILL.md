@@ -29,7 +29,7 @@ description: "主会话自然语言编排 swarm 轮次：人话开工，全程�
 | "再测一遍 / 验证下 W1-T1" | 复测 | 派 `subagent(test)`，带 `verify_cmd` + 边界 |
 | "现在啥情况 / 到哪了" | 进度 | 读队列 + timeline，回一句话（做了什么/卡在哪/谁在跑） |
 | "别跑了 / 停 / 回滚重来" | 叫停 | `swarm_halt` 熔断；要重做再 `swarm_revert` |
-| "放行 / 批准这单 / 高风险过了可以跑" | 高风险放行 | 调 `swarm_approve`（仅 high-risk 有效；批后派发自动解锁，不改状态） |
+| "放行 / 批准这单 / 高风险过了可以跑" | 高风险放行 | 调 `swarm_approve`（仅 high-risk 有效；多单批量用 `task_ids` 数组，原子语义；批后派发自动解锁，不改状态） |
 
 模糊（对不上五类）只追问一句，用 question 工具问清：
 "你这是 bugfix / 新需求 / 复测 / 进度 / 叫停哪一种？顺带给任务号或一句话需求。"
@@ -72,12 +72,13 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
   未配齐时 `/swarm-start` 直接拒收（门禁硬拦，不用主会话盘点）。
 - subagent 无模型传参则继承父会话模型（官方语义），不写死任何模型名。
 
-## 5. 四铁律 + 异常升级
+## 5. 五铁律 + 异常升级
 
 1. **接管宣告**：开工先说一句"我来编排本轮（run=<id>），全程代跑，有事叫你"，再调工具。
 2. **派发必带验收标准 + verify_cmd**：每个 subagent prompt 必须含任务的 `acceptance` 与 `verify_cmd`（+ 失败史），缺一律不派。
 3. **叫停即 halt 重排**：用户喊停先 `swarm_halt` 熔断，再问是 retry 还是 revert，不硬修。
 4. **两道门都必须等人回话**：开轮后问 planner（门一），入队后问 start（门二）；不代跑、不脑补、不跳过。
+5. **只有持轮会话派单**：claim/done/test/review 回执首行带 `run=`，派之前先对轮——别在 A 轮的会话里派 B 轮的活（串轮事故就是这么来的）。
 
 异常升级：HALT 已有推送（requester 会收到"⛔ HALT 通知 … 恢复：/swarm-retry --task X"），
 收到即停轮询、原话转述给用户，等拍板；高风险任务（`risk=high` 或命中 `sensitivePaths`）

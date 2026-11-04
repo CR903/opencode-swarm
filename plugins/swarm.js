@@ -39,7 +39,7 @@ import {
 } from '../lib/swarm-sessions.js';
 import {
   sanitizeRunId, resolveRun, writeCurrentRunId, readCurrentRunId, clearCurrentRunId,
-  archiveRun, deriveRunIdFromName, resolveUniqueRunId, runQueueHasTasks,
+  archiveRun, deriveRunIdFromName, resolveUniqueRunId, runQueueHasTasks, isRunDirNonEmpty,
   ensureRunMeta, listRuns, migrateLegacy, displayPath,
   rebuildQueueFromTimeline, readTimeline, stateBeforeLastGateEnter,
   readMeta, writeMeta, normalizeExecutor, executorForRole,
@@ -913,6 +913,43 @@ export default {
      * 共用：只读编排配置（供 swarm_config tool 与编排循环读模型映射）。
      * 纯读：读 meta + current 指针，永不写盘，失败回默认。
      */
+    /**
+     * #2 空 run 纠错：目标轮空（queue 缺失/零任务）时，按显示名找非空候选轮。
+     * runId 与显示名经常相同（--name 派生），-2 轮的显示名仍是原名 —— 直接报"队列已空"
+     * 会让人以为出 bug。返回 [{ runId, tasks }]（≤5），调用方拼指引；无候选回 []。永不抛错。
+     */
+    function suggestRunsByName(cwd, want) {
+      try {
+        const w = String(want ?? '').trim();
+        if (!w) return [];
+        const wantNames = [w];
+        try {
+          const nm = (readMeta(cwd, w) ?? {}).name;
+          if (typeof nm === 'string' && nm.trim() && !wantNames.includes(nm.trim())) wantNames.push(nm.trim());
+        } catch { /* 无 meta 即只有 runId 口径 */ }
+        const out = [];
+        for (const r of listRuns(cwd)) {
+          if (!r || r.runId === w) continue;
+          if (!wantNames.includes(String(r.name ?? '').trim())) continue;
+          let n = 0;
+          try { n = loadQueue(queueFor(r.runId)).length; } catch { n = 0; }
+          if (n > 0) out.push({ runId: r.runId, tasks: n });
+          if (out.length >= 5) break;
+        }
+        return out;
+      } catch {
+        return [];
+      }
+    }
+
+    function suggestText(cwd, startRun) {
+      const cands = suggestRunsByName(cwd, startRun);
+      if (!cands.length) return '';
+      return '\n\n⚠️ 同名显示名的非空轮：' +
+        cands.map((c) => `**${c.runId}**（${c.tasks} 个任务）`).join('、') +
+        `—— 你要找的可能是它。用 \`/swarm-start --run ${cands[0].runId}\` 重跑（runId 与显示名不是一回事）。`;
+    }
+
     function readConfig(runId) {
       try {
         const rid = sanitizeRunId(runId ?? currentRunId());
@@ -959,7 +996,7 @@ export default {
           return {
             dispatched: null,
             drained: false,
-            reason: `⛔ 高风险未批：${next.id}（risk=${next.risk ?? 'high'}）暂不派发。主会话先看 diff（git diff / git show <commit>）确认变更，再补批：/swarm_approve —— 调工具 swarm_approve {task_id: "${next.id}"}。批后自动解锁派发（approve 不改状态，只解锁）`,
+            reason: `⛔ 高风险未批：${next.id}（risk=${next.risk ?? 'high'}）暂不派发。主会话先看 diff（git diff / git show <commit>）确认变更，再补批：/swarm_approve —— 调工具 swarm_approve {task_id: "${next.id}"}（多单批量用 {task_ids: ["${next.id}", ...]}）。批后自动解锁派发（approve 不改状态，只解锁）`,
           };
         }
       }
@@ -1182,7 +1219,31 @@ export default {
             } else {
               const wantName = oneLine(f.name ?? f.title ?? '', 60);
               if (wantName) {
-                upRun = resolveUniqueRunId(cwd, deriveRunIdFromName(wantName));
+                // 同名默认复用（#1）：--name 派生遇到已占用的轮位时，不再静默加 -2。
+                // - 全空位 → 直接用 base；
+                // - 有台账但零任务 → 静默复用 base（空轮无串味风险，不 spawns -2 目录）；
+                // - 有任务 → 除非带 --new，否则回二选一卡（零落盘：不写 current/round/meta/queue）。
+                // 显式 --run 走 R2 老口径，不受影响。
+                const base = deriveRunIdFromName(wantName);
+                const newIntent = f.new !== undefined;
+                if (!isRunDirNonEmpty(cwd, base)) {
+                  upRun = base;
+                } else if (newIntent) {
+                  upRun = resolveUniqueRunId(cwd, base);
+                } else if (!runQueueHasTasks(cwd, base)) {
+                  upRun = base;
+                } else {
+                  let taskCount = 0;
+                  let oldName = '';
+                  try { taskCount = loadQueue(queueFor(base)).length; } catch { taskCount = 0; }
+                  try { oldName = (readMeta(cwd, base) ?? {}).name ?? ''; } catch { oldName = ''; }
+                  return reply(
+                    '## swarm-up：同名轮已存在（未创建任何会话，未写盘）\n' +
+                    `轮 **${base}** 已有 ${taskCount} 个任务` + (oldName ? `（需求名：**${oneLine(oldName, 40)}**）` : '') + '。二选一：\n' +
+                    `1. 复用旧轮（推荐）：\`/swarm-up --run ${base}\`（任务保留，在此轮上继续 planner/start，不会派生新目录）\n` +
+                    `2. 另开新轮：\`/swarm-up --name ${wantName} --new\`（派生 ${base}-2，全新空轮；旧轮原封不动）。`,
+                  );
+                }
                 derivedUpRun = true;
               } else {
                 upRun = resolveRun(cwd, { cfgRunId: rawRunId }).runId;
@@ -1199,7 +1260,9 @@ export default {
               // dry-run 只校验模型 + 打印计划，不建会话、不改队列
               const dry = [];
               for (const role of roles) {
-                const ref = f[`${ROLES[role].modelKey}_model`] ?? f[ROLES[role].modelKey] ?? '';
+                const ref = role === 'dev'
+                  ? (f.dev_model ?? f.dev ?? f.dev_backend_model ?? f.dev_backend ?? f.dev_frontend_model ?? f.dev_frontend ?? '')
+                  : (f[`${ROLES[role].modelKey}_model`] ?? f[ROLES[role].modelKey] ?? '');
                 const marks = [
                   ROLES[role].needsHuman ? '需人力复核' : '',
                   !ROLES[role].agent ? '占位，不可 up' : '',
@@ -1225,6 +1288,9 @@ export default {
                 const mk = def.modelKey;
                 if (hasVal(f[`${mk}_model`]) || hasVal(f[mk])) return true;
               }
+              // 分栈 dev flags 同属实质（#3b：up 显式带分栈模型即按需建 dev 常驻会话，不给不建）
+              if (hasVal(f.dev_backend_model) || hasVal(f.dev_backend)
+                || hasVal(f.dev_frontend_model) || hasVal(f.dev_frontend)) return true;
               if (hasVal(f.roles)) return true;
               return false;
             })();
@@ -1340,9 +1406,18 @@ export default {
             const index = await modelIndex(ctx);
             const problems = [];
             const chosen = new Map(); // role -> { providerID, id } | null
+            // #3b：dev 会话模型按需取（legacy --dev-model 通配优先，其次 backend，再 frontend；
+            // 只建一个 dev 常驻会话，分任务 subagent 仍按各栈模型派）。
+            const devEffectiveRef = () => (
+              f.dev_model ?? f.dev
+              ?? f.dev_backend_model ?? f.dev_backend
+              ?? f.dev_frontend_model ?? f.dev_frontend ?? ''
+            );
             for (const role of roles) {
               const def = ROLES[role];
-              const ref = f[`${def.modelKey}_model`] ?? f[def.modelKey] ?? '';
+              const ref = role === 'dev'
+                ? devEffectiveRef()
+                : (f[`${def.modelKey}_model`] ?? f[def.modelKey] ?? '');
               if (!ref) { chosen.set(role, null); continue; }
               const parsed = splitModel(ref);
               if (!parsed) {
@@ -1523,7 +1598,7 @@ export default {
             // 失败零落盘：先判队列存在（不存在直接回，不写 meta 不动 current），
             // 再 applyExecutorFlags（含模型校验），合法才 writeCurrentRunId。
             const qp = queueFor(startRun);
-            if (!existsSync(qp)) return reply(`swarm: 队列不存在 ${displayPath(cwd, qp)}（run=${startRun}），先让 planner 写入（#plan）。`);
+            if (!existsSync(qp)) return reply(`swarm: 队列不存在 ${displayPath(cwd, qp)}（run=${startRun}），先让 planner 写入（#plan）。` + suggestText(cwd, startRun));
             const execStart = await applyExecutorFlags(startRun, f);
             if (execStart.error) return reply(`❌ /swarm-start 参数错误：${execStart.error}`);
             // 按需模型门禁（硬拦，不靠主会话自觉）：按队列实际 stack 索要模型——
@@ -1544,6 +1619,14 @@ export default {
                 '补齐后重跑：`/swarm-start --run ' + startRun + ' ' + flags + ' <provider/model>…`（legacy --dev-model 可通配前后端；模型名查 `/swarm-models --search <关键词>`）。',
               );
             }
+            // #2 空轮先建议：queue 为空且有同名显示名的非空候选 → 直接回指引，
+            // 不认领 current、不改名、不清 pendingStart（零落盘；无候选走老路）。
+            try {
+              if (loadQueue(qp).length === 0) {
+                const sug = suggestText(cwd, startRun);
+                if (sug) return reply(`无可派发任务（队列已空，run=${startRun}）` + sug);
+              }
+            } catch { /* 读失败走老路 */ }
             if (cmdRun(f)) writeCurrentRunId(cwd, startRun); // 显式 --run 即认领该轮（队列存在 + 执行器合法才认领）
 
             // 命名：--name 优先；否则沿用 #plan 时落盘的需求名。
@@ -2260,7 +2343,7 @@ export default {
               const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
               const cur = loadQueue(qp).find((t) => t && t.id === input.task_id);
               if (cur && cur.status === 'dev_doing' && cur.assignee === who) {
-                return { content: `可继续：${cur.id} 已是 dev_doing 且归属 ${who}（属编排预派发，跳过 claim 直接开工）\n验收：${cur.acceptance}\n验证命令：${cur.verify_cmd}` };
+                return { content: `run=${runId} · 可继续：${cur.id} 已是 dev_doing 且归属 ${who}（属编排预派发，跳过 claim 直接开工）\n验收：${cur.acceptance}\n验证命令：${cur.verify_cmd}` };
               }
             } catch { /* 快照读失败就回退原失败文案 */ }
             return { content: `认领失败：${r.message}` };
@@ -2279,7 +2362,7 @@ export default {
               }
             }
           } catch { claimTip = ''; }
-          return { content: `已认领 ${r.task.id}\n验收：${r.task.acceptance}\n验证命令：${r.task.verify_cmd}${claimTip}` };
+          return { content: `run=${runId} · 已认领 ${r.task.id}\n验收：${r.task.acceptance}\n验证命令：${r.task.verify_cmd}${claimTip}` };
         },
       });
 
@@ -2404,7 +2487,7 @@ export default {
           const wake = await wakeRole('test', r.task, runId);
           const execWarns = Array.isArray(gate.evidence?.warnings) ? gate.evidence.warnings : [];
           const warnNote = execWarns.length ? `\n⚠️ verify warn（本次放行）：${execWarns.join('; ')}` : '';
-          return { content: `✅ 门禁通过（${gate.evidence?.durationMs ?? '?'}ms）：状态已流转 gate_check→test_doing（已交 test）\ncommit=${commit}${warnNote}${baseWarn}` + wakeLine(wake, 'test', task.id) };
+          return { content: `run=${runId} · ✅ 门禁通过（${gate.evidence?.durationMs ?? '?'}ms）：状态已流转 gate_check→test_doing（已交 test）\ncommit=${commit}${warnNote}${baseWarn}` + wakeLine(wake, 'test', task.id) };
         },
       });
 
@@ -2443,7 +2526,7 @@ export default {
               const excluded = excludedFindingIds(r.task);
               const depth = r.task.reviewDepth ?? 'quick';
               return {
-                content: `✅ ${task.id} 测试通过 → reviewing待审（review=true，depth=${depth}）。请派 reviewer subagent：agent=swarm-reviewer，prompt=任务JSON + git show ${task.commit ?? 'HEAD'} diff(截断50KB) + ${docHint} + excluded=[${excluded.join(',') || '空'}]。reviewer 调 swarm_review 出结论（approve→passed / request-changes→dev_doing）。`,
+                content: `run=${runId} · ✅ ${task.id} 测试通过 → reviewing待审（review=true，depth=${depth}）。请派 reviewer subagent：agent=swarm-reviewer，prompt=任务JSON + git show ${task.commit ?? 'HEAD'} diff(截断50KB) + ${docHint} + excluded=[${excluded.join(',') || '空'}]。reviewer 调 swarm_review 出结论（approve→passed / request-changes→dev_doing）。`,
               };
             }
             const r = await transition(runId, input.task_id, 'test_doing', { status: 'passed' }, { by: input.as ?? 'test', reason: 'test-pass', queue: input?.queue ?? null });
@@ -2456,8 +2539,8 @@ export default {
             }
             return {
               content: next.dispatched
-                ? `✅ ${task.id} 通过 → 已派发 ${next.dispatched.id}［状态已流转：queued→dev_doing］` + wakeLine(next.wake, 'dev', next.dispatched.id)
-                : `✅ ${task.id} 通过 → ${next.drained ? '队列已清空' : `暂无可派发（${next.reason}）`}${doneNote}`,
+                ? `run=${runId} · ✅ ${task.id} 通过 → 已派发 ${next.dispatched.id}［状态已流转：queued→dev_doing］` + wakeLine(next.wake, 'dev', next.dispatched.id)
+                : `run=${runId} · ✅ ${task.id} 通过 → ${next.drained ? '队列已清空' : `暂无可派发（${next.reason}）`}${doneNote}`,
             };
           }
 
@@ -2504,7 +2587,7 @@ export default {
             failed: input.failed_ids ?? '-', detail: (input.detail ?? '-').slice(0, 500),
           });
           const wake = await wakeRole('dev', r.task, runId);
-          return { content: `❌ ${task.id} 未过（第 ${retries}/${cfg.maxRetries} 次）：状态已流转 test_doing→dev_doing（回 dev）` + wakeLine(wake, 'dev', task.id) };
+          return { content: `run=${runId} · ❌ ${task.id} 未过（第 ${retries}/${cfg.maxRetries} 次）：状态已流转 test_doing→dev_doing（回 dev）` + wakeLine(wake, 'dev', task.id) };
         },
       });
 
@@ -2555,8 +2638,8 @@ export default {
             }
             return {
               content: next.dispatched
-                ? `✅ ${task.id} 评审通过 → 已派发 ${next.dispatched.id}［状态已流转：queued→dev_doing］` + wakeLine(next.wake, 'dev', next.dispatched.id)
-                : `✅ ${task.id} 评审通过 → ${next.drained ? '队列已清空' : `暂无可派发（${next.reason}）`}${doneNote}`,
+                ? `run=${runId} · ✅ ${task.id} 评审通过 → 已派发 ${next.dispatched.id}［状态已流转：queued→dev_doing］` + wakeLine(next.wake, 'dev', next.dispatched.id)
+                : `run=${runId} · ✅ ${task.id} 评审通过 → ${next.drained ? '队列已清空' : `暂无可派发（${next.reason}）`}${doneNote}`,
             };
           }
 
@@ -2604,7 +2687,7 @@ export default {
             failed: failed_ids || '-', detail: detail.slice(0, 500),
           });
           const wake = await wakeRole('dev', r.task, runId);
-          return { content: `❌ ${task.id} 评审打回（第 ${newRounds}/${REVIEW_MAX_ROUNDS} 次）：状态已流转 reviewing→dev_doing（回 dev）：${failed_ids}` + wakeLine(wake, 'dev', task.id) };
+          return { content: `run=${runId} · ❌ ${task.id} 评审打回（第 ${newRounds}/${REVIEW_MAX_ROUNDS} 次）：状态已流转 reviewing→dev_doing（回 dev）：${failed_ids}` + wakeLine(wake, 'dev', task.id) };
         },
       });
 
@@ -2656,47 +2739,101 @@ export default {
 
       editor.add({
         name: 'swarm_approve',
-        description: '高风险放行：high-risk 任务人工批准（写 kind=approve 审计行，幂等；非 high-risk 拒收并明说无需审批；approve 只解锁派发，不改状态）',
+        description: '高风险放行：high-risk 任务人工批准（写 kind=approve 审计行，幂等；非 high-risk 拒收并明说无需审批；approve 只解锁派发，不改状态；task_ids 数组批量放行，原子语义）',
         input: {
           type: 'object',
-          properties: { task_id: { type: 'string' }, ...S },
-          required: ['task_id'],
+          properties: { task_id: { type: 'string' }, task_ids: { type: 'array', items: { type: 'string' } }, ...S },
+          required: [],
           additionalProperties: false,
         },
         execute: async (input, toolCtx) => {
-          const runId = runIdForCall(input, toolCtx, input?.task_id);
+          const ids = Array.isArray(input?.task_ids)
+            ? input.task_ids.map((x) => String(x ?? '').trim()).filter(Boolean)
+            : null;
+          const single = String(input?.task_id ?? '').trim();
+          if ((!ids || !ids.length) && (!single || single === 'true')) {
+            return { content: '用法：swarm_approve {task_id: "<id>"} 或 {task_ids: ["<a>", "<b>"]}（仅 high-risk 任务可批；批量原子：先验后写）' };
+          }
+          // 单任务走老文案（逐字锁定，e2e 断言），批量走原子语义。
+          if (!ids || !ids.length) {
+            const id = single;
+            const runId = runIdForCall(input, toolCtx, id);
+            bindSession(runId, sessionOf(toolCtx, input), 'human');
+            const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
+            const task = loadQueue(qp).find((t) => t && t.id === id);
+            if (!task) return { content: `任务不存在：${id}（无需审批）` };
+            if (!highRiskTasks([task], cfg.sensitivePaths).length) {
+              return { content: `❌ ${id} 非高风险任务（risk=${task.risk ?? 'medium'}），无需审批（approve 仅 high-risk 可用），直接按正常流程派发` };
+            }
+            if (task.status === 'passed') return { content: `${id} 已 passed，无需审批` };
+            const tlPath = timelineFor(runId);
+            let rows = [];
+            try {
+              const rr = resolveRun(cwd, { run: runId, queue: effQueue(), cfgRunId: rawRunId });
+              rows = readTimeline(rr.runDir).filter((r) => r && r.taskId === id && r.kind === 'approve');
+            } catch {
+              rows = [];
+            }
+            if (rows.length) {
+              const last = rows[rows.length - 1];
+              return { content: `run=${runId} · ✅ 已批：${id} 已有批准记录（by=${last.by ?? '-'}，seq=${last.seq ?? '?'}），不重复写行` };
+            }
+            const by = input?.as ?? 'human';
+            const sid = (toolCtx && (toolCtx.sessionID ?? toolCtx.sessionId)) ?? input?.sessionID ?? by;
+            const risk = task.risk ?? 'high';
+            appendTimeline(tlPath, {
+              taskId: id, kind: 'approve', from: null, to: null,
+              by, reason: `approve:risk=${risk}`,
+              commit: task.commit ?? '-', retries: task.retries ?? 0,
+              patch: { approved: true, risk, session: String(sid) }, ts: new Date().toISOString(),
+            });
+            return { content: `run=${runId} · ✅ 已批准 ${id}（risk=${risk}，by=${by}）：高风险放行，派发已解锁（approve 不改状态，当前 ${task.status}）` };
+          }
+          const targets = [...new Set(ids)];
+          const runId = runIdForCall(input, toolCtx, targets[0]);
           bindSession(runId, sessionOf(toolCtx, input), 'human');
           const qp = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
-          const id = String(input?.task_id ?? '').trim();
-          if (!id || id === 'true') return { content: '用法：swarm_approve {task_id: "<id>"}（仅 high-risk 任务可批）' };
-          const task = loadQueue(qp).find((t) => t && t.id === id);
-          if (!task) return { content: `任务不存在：${id}（无需审批）` };
-          if (!highRiskTasks([task], cfg.sensitivePaths).length) {
-            return { content: `❌ ${id} 非高风险任务（risk=${task.risk ?? 'medium'}），无需审批（approve 仅 high-risk 可用），直接按正常流程派发` };
+          const queued = loadQueue(qp);
+          // 批量原子：先验全部（缺失/非 high 整批拒收，零写行），再逐个写行。
+          const missing = targets.filter((id) => !queued.some((t) => t && t.id === id));
+          if (missing.length) return { content: `❌ 批量拒收：任务不存在：${missing.join('、')}（整批未写行，请修正后重批）` };
+          const nonHigh = targets.filter((id) => {
+            const t = queued.find((x) => x && x.id === id);
+            return !highRiskTasks([t], cfg.sensitivePaths).length;
+          });
+          if (nonHigh.length) {
+            return { content: `❌ 批量拒收：${nonHigh.join('、')} 非高风险任务（approve 仅 high-risk 可用），整批未写行（请摘掉它们重批）` };
           }
-          if (task.status === 'passed') return { content: `${id} 已 passed，无需审批` };
           const tlPath = timelineFor(runId);
           let rows = [];
           try {
             const rr = resolveRun(cwd, { run: runId, queue: effQueue(), cfgRunId: rawRunId });
-            rows = readTimeline(rr.runDir).filter((r) => r && r.taskId === id && r.kind === 'approve');
+            rows = readTimeline(rr.runDir).filter((r) => r && r.kind === 'approve');
           } catch {
             rows = [];
           }
-          if (rows.length) {
-            const last = rows[rows.length - 1];
-            return { content: `✅ 已批：${id} 已有批准记录（by=${last.by ?? '-'}，seq=${last.seq ?? '?'}），不重复写行` };
-          }
           const by = input?.as ?? 'human';
           const sid = (toolCtx && (toolCtx.sessionID ?? toolCtx.sessionId)) ?? input?.sessionID ?? by;
-          const risk = task.risk ?? 'high';
-          appendTimeline(tlPath, {
-            taskId: id, kind: 'approve', from: null, to: null,
-            by, reason: `approve:risk=${risk}`,
-            commit: task.commit ?? '-', retries: task.retries ?? 0,
-            patch: { approved: true, risk, session: String(sid) }, ts: new Date().toISOString(),
-          });
-          return { content: `✅ 已批准 ${id}（risk=${risk}，by=${by}）：高风险放行，派发已解锁（approve 不改状态，当前 ${task.status}）` };
+          const lines = [];
+          for (const id of targets) {
+            const task = queued.find((t) => t && t.id === id);
+            if (task.status === 'passed') { lines.push(`${id} 已 passed，无需审批`); continue; }
+            const prior = rows.filter((r) => r && r.taskId === id && r.kind === 'approve');
+            if (prior.length) {
+              const last = prior[prior.length - 1];
+              lines.push(`run=${runId} · ✅ 已批：${id} 已有批准记录（by=${last.by ?? '-'}，seq=${last.seq ?? '?'}），不重复写行`);
+              continue;
+            }
+            const risk = task.risk ?? 'high';
+            appendTimeline(tlPath, {
+              taskId: id, kind: 'approve', from: null, to: null,
+              by, reason: `approve:risk=${risk}`,
+              commit: task.commit ?? '-', retries: task.retries ?? 0,
+              patch: { approved: true, risk, session: String(sid) }, ts: new Date().toISOString(),
+            });
+            lines.push(`run=${runId} · ✅ 已批准 ${id}（risk=${risk}，by=${by}）：高风险放行，派发已解锁（approve 不改状态，当前 ${task.status}）`);
+          }
+          return { content: lines.join('\n') };
         },
       });
 

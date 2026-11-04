@@ -52,7 +52,7 @@
 swarm_read_queue 看现状 → 分类意图 → plan → /swarm-start 派发 → dev会话或subagent → 轮询直到 drained 或 HALT → 验收通过主会话调 /swarm-clean 归档（人不敲命令）→ 汇报
 ```
 
-完整 recipe（含 prompt 模板、模型映射、四铁律）见 skill
+完整 recipe（含 prompt 模板、模型映射、五铁律）见 skill
 `.opencode/skills/swarm-orchestrate/SKILL.md`；
 执行器细节与判活 fence 见 §9（附录，编排循环 recipe 原文仍在那里，
 与 `/swarm-mode` 输出逐字一致，改文案先改 `swarm.js` 的 `DRAINED_RECIPE`）；
@@ -126,7 +126,9 @@ plan 用发起命令的这个会话），所以正常只建 dev（hybrid）或 d
 （多开几轮 swarm 也能一眼分清）。
 
 不带 `--run` 时，本轮 runId 由 `--name` 派生（只留中文/英文/数字/`_`/`-`，截 40 字；
-派不出名字回退 `run-MMDD-HHmm`；与已存在的非空轮重名自动加 `-2`/`-3` 后缀），
+派不出名字回退 `run-MMDD-HHmm`）。同名轮已存在时**默认复用**：有任务的旧轮回二选一卡
+（`/swarm-up --run <旧轮>` 复用，或 `--name <名> --new` 另开新轮）；零任务空轮静默复用，
+不再静默加 `-2` 后缀（runId 与显示名不是一回事：`-2` 轮的显示名仍是原名，`start` 前先对轮）。
 旧轮目录原封不动；新轮落盘成功后自动成为当前轮（后续不带 `--run` 的命令都看它）。
 
 显式 `--run` 指向还有任务的旧轮会被拒收（防新会话挂到旧队列上串味），按提示
@@ -204,6 +206,8 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 > 模型按队列实际 stack 按需索要：只含 backend 的轮不要 `--dev-frontend-model`，只含 frontend 的不要
 > `--dev-backend-model`，有评审任务再加 `--reviewer-model`；缺啥 start 直接拒收（门禁硬拦，不清 pendingStart、
 > 不派发），按提示补齐重跑。`swarm_config` 会带出 `stacks`/`missingModels`，一眼看清缺啥。
+> 空轮报"队列已空"时若有同名显示名的非空轮，start 会直接指路（用 `--run <runId>` 重跑）。
+> high-risk 多单批量放行：`swarm_approve` 支持 `task_ids` 数组（原子语义：先验后写）。
 
 输出：`已派发 W1-T1（wave=W1）→ dev` + `已唤醒 ses_xxx（dev）→ 该会话开始执行 W1-T1`。
 队列里 `W1-T1` 变 `dev_doing`，通道里出现 `[TASK-ASSIGN] task=W1-T1 ... to=dev`，
