@@ -20,7 +20,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { loadQueue, saveQueueAtomic, casTransition, enqueueTask, transitionTask, withLock, invalidate, appendTimeline } from '../lib/swarm-store.js';
+import { loadQueue, saveQueueAtomic, casTransition, enqueueTask, transitionTask, withLock, invalidate, appendTimeline, requiredModels } from '../lib/swarm-store.js';
 import { TRANSITIONS, STATUSES, can, allowedFrom, checkTransition } from '../lib/swarm-fsm.js';
 import { sanitizeRunId, resolveRun, writeCurrentRunId, listRuns, migrateLegacy, timelinePathFor, rebuildQueueFromTimeline, readTimeline, readMeta, writeMeta, ensureRunMeta, normalizeExecutor, EXECUTORS, validateFindings, validateReviewVerdict, mergeFindings, findingKey, excludedFindingIds, excludedIntersection, resolveReviewDoc, FINDING_SEVERITIES, REVIEW_VERDICTS, REVIEW_MAX_ROUNDS, deriveRunIdFromName, isRunDirNonEmpty, resolveUniqueRunId, runQueueHasTasks, sessionRunIndex, runIdForSession, runIdForTask } from '../lib/swarm-run.js';
 import { parseCommand, runVerify, DEFAULT_ALLOWLIST } from '../lib/swarm-exec.js';
@@ -34,7 +34,7 @@ let dir;
 let queue;
 
 const emptyTask = (over = {}) => ({
-  id: 'W1-T1', wave: 'W1', title: 't', acceptance: 'a', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', ...over,
+  id: 'W1-T1', wave: 'W1', title: 't', acceptance: 'a', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', stack: 'backend', ...over,
 });
 
 before(() => {
@@ -1201,7 +1201,7 @@ describe('B3 exec 收敛', () => {
 // ───────────────────────────── R1: testing 必填（红测先行） ─────────────────────────────
 describe('R1 testing required', () => {
   const rowNoTesting = (over = {}) => ({
-    id: 'R1-X', wave: 'W1', title: 't', acceptance: 'a', verify_cmd: 'node ok.mjs', ...over,
+    id: 'R1-X', wave: 'W1', title: 't', acceptance: 'a', verify_cmd: 'node ok.mjs', stack: 'backend', ...over,
   });
 
   test('enqueue 缺 testing 被拒且 reason 指明 testing', () => {
@@ -1832,5 +1832,44 @@ describe('secret gate', () => {
     } finally {
       rmSync(g, { recursive: true, force: true });
     }
+  });
+});
+
+describe('R2 stack required（backend/frontend/integration 三选一）', () => {
+  const rowNoStack = (over = {}) => ({
+    id: 'R2-X', wave: 'W1', title: 't', acceptance: 'a', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', ...over,
+  });
+
+  test('enqueue 缺 stack 被拒且 reason 指明三选一', () => {
+    const q = join(dir, 'r2-reject.jsonl');
+    const r = enqueueTask(q, rowNoStack({ id: 'R2-A' }));
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /stack.*backend\/frontend\/integration/);
+  });
+
+  test('enqueue 非法 stack 被拒；三合法值放行', () => {
+    const q = join(dir, 'r2-reject2.jsonl');
+    assert.match((enqueueTask(q, rowNoStack({ id: 'R2-B', stack: 'fullstack' })).reason ?? 'ok'), /stack/);
+    assert.match((enqueueTask(q, rowNoStack({ id: 'R2-C', stack: '' })).reason ?? 'ok'), /stack/);
+    for (const st of ['backend', 'frontend', 'integration']) {
+      assert.equal(enqueueTask(q, rowNoStack({ id: `R2-OK-${st}`, stack: st })).ok, true);
+    }
+    assert.equal(loadQueue(q).find((t) => t.id === 'R2-OK-frontend').stack, 'frontend');
+  });
+
+  test('requiredModels：纯 legacy 轮零要求；按需只索要出现的 stack', () => {
+    assert.deepEqual(requiredModels([{ id: 'L', status: 'queued' }], {}).missing, []);
+    const b = requiredModels([{ id: 'B', status: 'queued', stack: 'backend', review: false }], {});
+    assert.deepEqual(b.stacks, ['backend']);
+    assert.deepEqual(b.missing.map((m) => m.key), ['dev_backend', 'test']);
+    const f = requiredModels(
+      [{ id: 'F', status: 'queued', stack: 'frontend', review: false }],
+      { dev_backend: 'p/m', test: 'p/m' },
+    );
+    assert.deepEqual(f.missing.map((m) => m.key), ['dev_frontend'], '后端模型不对前端任务放行');
+    const i = requiredModels([{ id: 'I', status: 'queued', stack: 'integration', review: false }], { dev_frontend: 'p/m', test: 'p/m' });
+    assert.deepEqual(i.missing, [], '联调任一侧 dev 即可');
+    const done = requiredModels([{ id: 'D', status: 'passed', stack: 'backend', review: true }], {});
+    assert.deepEqual(done.missing, [], '已 passed 不再索要模型');
   });
 });

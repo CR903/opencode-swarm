@@ -29,7 +29,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadQueue, invalidate, transitionTask, enqueueTask, saveQueueAtomic, appendTimeline } from '../lib/swarm-store.js';
+import { loadQueue, invalidate, transitionTask, enqueueTask, saveQueueAtomic, appendTimeline, requiredModels, TASK_STACKS } from '../lib/swarm-store.js';
 import { createFileBus, eventId } from '../lib/swarm-filebus.js';
 import { checkGate, headCommit, matchPatterns, baseHead } from '../lib/swarm-gate.js';
 import { parseTag, expandTag, ROLES, hasRole } from '../lib/swarm-roles.js';
@@ -919,7 +919,15 @@ export default {
         const meta = readMeta(cwd, rid) ?? {};
         const ex = normalizeExecutor(meta.executor);
         const rms = (meta.roleModels && typeof meta.roleModels === 'object') ? meta.roleModels : {};
-        return { executor: ex, roleModels: { ...rms }, currentRun: currentRunId(), runId: rid };
+        // 按需分配口径：本轮实际 stack + 缺的模型键（人工补齐用；纯 legacy 轮两者皆空）。
+        let stacks = [];
+        let missing = [];
+        try {
+          const r = requiredModels(loadQueue(queueFor(rid)), rms);
+          stacks = r.stacks;
+          missing = r.missing.map((m) => m.key);
+        } catch { stacks = []; missing = []; }
+        return { executor: ex, roleModels: { ...rms }, currentRun: currentRunId(), runId: rid, stacks, validStacks: [...TASK_STACKS], missingModels: missing };
       } catch {
         return { executor: 'hybrid', roleModels: {}, currentRun: 'default', runId: 'default' };
       }
@@ -973,7 +981,9 @@ export default {
         if (e !== 'sessions' && e !== 'subagents' && e !== 'hybrid') return { error: `未知执行器：${e}（只接受 sessions|subagents|hybrid）` };
         patch.executor = e;
       }
-      // 待校验的模型 flags：沿 ROLES 表收集（写法与 /swarm-up 对齐：`--<modelKey>-model` 优先，裸 `--<modelKey>` 兜底）。
+      // 待校验的模型 flags：沿 ROLES 表收集（写法与 /swarm-up 对齐：`--<modelKey>-model` 优先，裸 `--<modelKey>` 兜底）
+      // ＋分栈 dev 键（`--dev-backend-model` / `--dev-frontend-model`，裸写亦可）：只在 start 时按需索要，
+      // up 时不问（开轮不定模型）。legacy `--dev-model` 通配前后端（老行为零变）。
       // dev/test/reviewer 校验通过后照常落 roleModels；planner 只验不落，非法同样拒收。
       const pending = [];
       for (const [role, def] of Object.entries(ROLES)) {
@@ -982,6 +992,13 @@ export default {
         const ref = String(raw).trim();
         if (!ref) continue;
         pending.push({ role, ref });
+      }
+      for (const key of ['dev_backend', 'dev_frontend']) {
+        const raw = f[`${key}_model`] ?? f[key];
+        if (raw === undefined || raw === 'true') continue;
+        const ref = String(raw).trim();
+        if (!ref) continue;
+        pending.push({ role: key, ref });
       }
       if (pending.length) {
         let index = null;
@@ -1008,6 +1025,10 @@ export default {
       }
       const rm = {};
       if (f.dev_model !== undefined && f.dev_model !== 'true') rm.dev = String(f.dev_model).trim();
+      if (f.dev_backend_model !== undefined && f.dev_backend_model !== 'true') rm.dev_backend = String(f.dev_backend_model).trim();
+      else if (f.dev_backend !== undefined && f.dev_backend !== 'true') rm.dev_backend = String(f.dev_backend).trim();
+      if (f.dev_frontend_model !== undefined && f.dev_frontend_model !== 'true') rm.dev_frontend = String(f.dev_frontend_model).trim();
+      else if (f.dev_frontend !== undefined && f.dev_frontend !== 'true') rm.dev_frontend = String(f.dev_frontend).trim();
       if (f.tester_model !== undefined && f.tester_model !== 'true') rm.test = String(f.tester_model).trim();
       if (f.reviewer_model !== undefined && f.reviewer_model !== 'true') rm.reviewer = String(f.reviewer_model).trim();
       if (Object.keys(rm).length) {
@@ -1275,29 +1296,29 @@ export default {
                     ? `轮已复用：run=${upRun}（已有会话登记原样保留，未新建会话；round/meta/current已对齐，sidebar/footer可见）\n`
                     : `空轮已建：run=${upRun}（queue空+round/meta/current已落盘，sidebar/footer立刻可见，零任务态非报错）\n`;
                 return reply(
-                  '## swarm-up：开轮前先问三件事（未创建任何会话）\n' +
+                  '## swarm-up：开轮只建空轮（未创建任何会话，模型不在这里定）\n' +
                   stateLine +
-                  (upName ? `\n需求名已预填：**${upName}**（第 2 问直接用它，不用重问）\n` : '') + '\n' +
-                  '用 question 工具问清下面三项（括号里是默认值，不答就按默认走）：\n\n' +
-                  '1. 模型：planner / dev / tester 各用什么？（默认：planner 强推理、dev 便宜量大、tester 严格；查：`/swarm-models --search <关键词>`）\n' +
-                  '2. 需求：本轮需求名（一句话）＋ 需求正文去处（prd 路径，或直接口述）。\n' +
-                  '3. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。\n' +
+                  (upName ? `\n需求名已预填：**${upName}**（第 1 问直接用它，不用重问）\n` : '') + '\n' +
+                  '用 question 工具问清下面两项（括号里是默认值，不答就按默认走）：\n\n' +
+                  '1. 需求：本轮需求名（一句话）＋ 需求正文去处（prd 路径，或直接口述；planner 阶段会落成 PRD 再按 backend/frontend/integration 拆任务）。\n' +
+                  '2. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。\n' +
+                  '模型说明：开轮不定模型。planner 拆完任务后，在 `/swarm-start` 时按实际 stack 按需分配（backend 要 `--dev-backend-model`，frontend 要 `--dev-frontend-model`，另需 `--tester-model`，有评审任务再加 `--reviewer-model`；legacy `--dev-model` 可通配前后端）。缺啥门禁硬拦，不用现在定；查模型：`/swarm-models --search <关键词>`。\n' +
                   '评审默认值：medium/high 默认进评审（test pass 后进 reviewing），low 默认直通（显式 review:true 可开，显式 review:false 可关）。\n\n' +
                   '本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面三项。\n\n' +
-                  `下一步：拿到答案后重跑带参 \`/swarm-up --run ${upRun} --planner-model <p> --dev-model <d> --tester-model <t>${upName ? ` --name ${upName}` : ''}\`（复用本空轮，不会再派生新轮），然后先问用户「是否开始 planner？」——得到确认后，在本会话（主会话即 planner，不再另建 plan 会话）里 \`#plan 拆解 <需求>\`，不要自行开始分析需求。`,
+                  `下一步：拿到答案后重跑带参 \`/swarm-up --run ${upRun} --planner-model <p> --dev-model <d> --tester-model <t>${upName ? ` --name ${upName}` : ''}\`（复用本空轮，不会再派生新轮；模型不用现在给，start 时按需分配），然后先问用户「是否开始 planner？」——得到确认后，在本会话（主会话即 planner，不再另建 plan 会话）里 \`#plan 拆解 <需求>\`，不要自行开始分析需求。`,
                 );
               }
               const upNameBare = upName;
               return reply(
-                '## swarm-up：开轮前先问三件事（未创建任何会话）\n' +
-                (upNameBare ? `\n需求名已预填：**${upNameBare}**（第 2 问直接用它，不用重问）\n` : '') + '\n' +
-                '用 question 工具问清下面三项（括号里是默认值，不答就按默认走）：\n\n' +
-                '1. 模型：planner / dev / tester 各用什么？（默认：planner 强推理、dev 便宜量大、tester 严格；查：`/swarm-models --search <关键词>`）\n' +
-                '2. 需求：本轮需求名（一句话）＋ 需求正文去处（prd 路径，或直接口述）。\n' +
-                '3. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。\n' +
+                '## swarm-up：开轮只建空轮（未创建任何会话，模型不在这里定）\n' +
+                (upNameBare ? `\n需求名已预填：**${upNameBare}**（第 1 问直接用它，不用重问）\n` : '') + '\n' +
+                '用 question 工具问清下面两项（括号里是默认值，不答就按默认走）：\n\n' +
+                '1. 需求：本轮需求名（一句话）＋ 需求正文去处（prd 路径，或直接口述；planner 阶段会落成 PRD 再按 backend/frontend/integration 拆任务）。\n' +
+                '2. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。\n' +
+                '模型说明：开轮不定模型。planner 拆完任务后，在 `/swarm-start` 时按实际 stack 按需分配（backend 要 `--dev-backend-model`，frontend 要 `--dev-frontend-model`，另需 `--tester-model`，有评审任务再加 `--reviewer-model`；legacy `--dev-model` 可通配前后端）。缺啥门禁硬拦，不用现在定；查模型：`/swarm-models --search <关键词>`。\n' +
                 '评审默认值：medium/high 默认进评审（test pass 后进 reviewing），low 默认直通（显式 review:true 可开，显式 review:false 可关）。\n\n' +
                 '本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面三项。\n\n' +
-                '下一步：拿到答案后重跑带参 `/swarm-up --planner-model <p> --dev-model <d> --tester-model <t> --name <需求名>`，然后先问用户「是否开始 planner？」——得到确认后，在本会话（主会话即 planner，不再另建 plan 会话）里 `#plan 拆解 <需求>`，不要自行开始分析需求。',
+                '下一步：拿到答案后重跑带参 `/swarm-up --name <需求名>`（只补需求名，不定模型），然后先问用户「是否开始 planner？」——得到确认后，在本会话（主会话即 planner，不再另建 plan 会话）里 `#plan 拆解 <需求>`，不要自行开始分析需求。',
               );
             }
 
@@ -1488,7 +1509,7 @@ export default {
 
       editor.add({
         name: 'swarm-start',
-        description: '派发第一个 queued 任务给 dev（会唤醒 dev 会话；可用 --name 给本轮命名）',
+        description: '派发第一个 queued 任务给 dev（会唤醒 dev 会话；可用 --name 给本轮命名；模型按需硬门禁：backend要--dev-backend-model，frontend要--dev-frontend-model，另需--tester-model，有评审任务再加--reviewer-model）',
         execute: async ({ sessionID, prompt }) => {
           const reply = (text) => ctx.session.prompt({ sessionID, text });
           try {
@@ -1505,6 +1526,24 @@ export default {
             if (!existsSync(qp)) return reply(`swarm: 队列不存在 ${displayPath(cwd, qp)}（run=${startRun}），先让 planner 写入（#plan）。`);
             const execStart = await applyExecutorFlags(startRun, f);
             if (execStart.error) return reply(`❌ /swarm-start 参数错误：${execStart.error}`);
+            // 按需模型门禁（硬拦，不靠主会话自觉）：按队列实际 stack 索要模型——
+            // 只含 backend 的轮不要 dev_frontend，只含 frontend 的不要 dev_backend；
+            // 纯 legacy 轮（任务无 stack）零要求。缺啥拒收：不认领 current、不改名、不清 pendingStart、不派发。
+            let reqModels = { stacks: [], missing: [] };
+            try {
+              const allTasks = loadQueue(qp);
+              let rmsNow = {};
+              try { rmsNow = (readMeta(cwd, startRun) ?? {}).roleModels ?? {}; } catch { rmsNow = {}; }
+              reqModels = requiredModels(allTasks, rmsNow);
+            } catch { reqModels = { stacks: [], missing: [] }; }
+            if (reqModels.missing.length) {
+              const flags = reqModels.missing.map((m) => m.flag).join(' ');
+              return reply(
+                '❌ /swarm-start 模型未配齐（run=' + startRun + '，本轮 stack：' + (reqModels.stacks.join('/') || '-') + '）——门禁硬拦，未派发、未清 pendingStart。\n' +
+                reqModels.missing.map((m) => '- ' + m.key + '：' + m.reason).join('\n') + '\n' +
+                '补齐后重跑：`/swarm-start --run ' + startRun + ' ' + flags + ' <provider/model>…`（legacy --dev-model 可通配前后端；模型名查 `/swarm-models --search <关键词>`）。',
+              );
+            }
             if (cmdRun(f)) writeCurrentRunId(cwd, startRun); // 显式 --run 即认领该轮（队列存在 + 执行器合法才认领）
 
             // 命名：--name 优先；否则沿用 #plan 时落盘的需求名。
@@ -2143,10 +2182,10 @@ export default {
 
       editor.add({
         name: 'swarm_plan',
-        description: 'planner 专用：批量入队任务（每项必须含 id/wave/title/acceptance/verify_cmd/testing，testing 非空，可写"同 verify_cmd"）；name 给本轮需求命名',
+        description: 'planner 专用：批量入队任务（每项必须含 id/wave/title/acceptance/verify_cmd/testing/stack，testing 非空可写"同 verify_cmd"，stack 三选一 backend/frontend/integration）；name 给本轮需求命名；prd 传 PRD 路径（记入 meta 备查）',
         input: {
           type: 'object',
-          properties: { tasks: { type: 'array', items: { type: 'object' } }, name: { type: 'string' }, ...S },
+          properties: { tasks: { type: 'array', items: { type: 'object' } }, name: { type: 'string' }, prd: { type: 'string' }, ...S },
           required: ['tasks'],
           additionalProperties: false,
         },
@@ -2186,7 +2225,14 @@ export default {
           if (existingCount > 0) {
             hintLine = `\n⚠️ 该轮已有${existingCount}个任务，本次入队会混排；要用新轮请换run或先clean归档（仅提示，入队照常）`;
           }
-          return { content: (results.join('\n') || '(no tasks)') + nameLine + hintLine };
+          // PRD 透传（只记路径备查，不校验存在——planner 在主会话写文件，路径约定的事不归门禁管）。
+          let prdLine = '';
+          const prd = oneLine(input.prd ?? '', 200);
+          if (prd) {
+            try { writeMeta(cwd, runId, { prdPath: prd }); } catch { /* best-effort */ }
+            prdLine = `\nPRD：${prd}`;
+          }
+          return { content: (results.join('\n') || '(no tasks)') + nameLine + hintLine + prdLine };
         },
       });
 

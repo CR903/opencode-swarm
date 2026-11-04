@@ -14,7 +14,7 @@
 | 唤起 dev | `#dev W1-T1` |
 | 唤起 tester | `#test W1-T1` |
 | 语义评审（review 开的任务；medium/high 默认进，low 显式开） | test pass 后自动进 `reviewing`，编排会话派 `subagent(agent=swarm-reviewer)`，reviewer 调 `swarm_review`（approve→passed / request-changes→dev_doing） |
-| 一键开三个会话 | `/swarm-up --planner-model a/b --dev-model c/d --tester-model e/f --name 需求名` |
+| 一键开三个会话 | `/swarm-up --dev-model c/d --tester-model e/f --name 需求名`（模型也可在 start 时再给） |
 | 查可用模型 | `/swarm-models --search deepseek` |
 | 看进度 | `/swarm-status`（含会话+模型+谁在跑+质量两行；`--all` 含 reviewing 列） |
 | 单任务时间线 | `/swarm-status --task W1-T1`（testing/summary/disposition/failed_ids/detail + findings 全量） |
@@ -90,7 +90,7 @@ node --test .opencode/lib/swarm.test.mjs .opencode/plugins/swarm.e2e.test.mjs
 **R1 testing/summary 必填**、**R2 gates 白名单开关**、**R3 baseHEAD 竞态**、**R4 revert 回门禁前**、
 **R5 disposition 定性**、**R6 rounds-to-pass 与 HALT 摘要**、**R7 nightly 只读重跑**。
 
-### 1.3 开三个会话并指定模型
+### 1.3 开三个会话并指定模型（模型也可在 start 时再给，见 §1.4 与第 ② 步）
 
 ```bash
 /swarm-up \
@@ -135,7 +135,7 @@ plan 用发起命令的这个会话），所以正常只建 dev（hybrid）或 d
 
 > 为什么分模型：planner 要强推理（拆得准），dev 要能写代码且便宜，tester 要严格执行、不需要创造力。
 
-### 1.4 无参 /swarm-up：先问三件事再开轮
+### 1.4 无参 /swarm-up：开轮只建空轮（模型不在这里定）
 
 裸 `/swarm-up`（无 `--name`、无 `--run`）不建会话、不写盘、不读队列，只回一张开场卡。
 单 `--name`（无任何模型/执行器 flag）仍回开场卡并回显已预填的需求名，但会先建空轮
@@ -143,17 +143,17 @@ plan 用发起命令的这个会话），所以正常只建 dev（hybrid）或 d
 sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）。
 显式 `--run`（无实质 flag）同理建空轮复用；指到非空旧轮时沿用现有拒收与 `--force` 口径。
 `--force` 复用非空轮 / 复用已有会话登记的轮时，开场卡首行改为"轮已复用"并注明保留项（不谎报空轮）；任何复用路径都不截断已有队列与会话登记。
-主会话用 question 工具问清三项（括号里是默认值，不答就按默认走）：
+主会话用 question 工具问清两项（括号里是默认值，不答就按默认走）：
 
-1. 模型：planner / dev / tester 各用什么？（默认：planner 强推理、dev 便宜量大、tester 严格；查：`/swarm-models --search <关键词>`）
-2. 需求：本轮需求名（一句话）＋ 需求正文去处（prd 路径，或直接口述）。
-3. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。
+1. 需求：本轮需求名（一句话）＋ 需求正文去处（prd 路径，或直接口述；planner 阶段会落成 PRD 再按 backend/frontend/integration 拆任务）。
+2. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。
 
-开场卡禁令（逐字）：本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面三项。
+模型说明：开轮不定模型。planner 拆完任务后，在 `/swarm-start` 时按实际 stack 按需分配（backend 要 `--dev-backend-model`，frontend 要 `--dev-frontend-model`，另需 `--tester-model`，有评审任务再加 `--reviewer-model`；legacy `--dev-model` 可通配前后端）。缺啥门禁硬拦，不用现在定；查模型：`/swarm-models --search <关键词>`。
 
-拿到答案后重跑带参 `/swarm-up --run <空轮runId> --planner-model <p> --dev-model <d> --tester-model <t> --name <需求名>`
-（复用本空轮，不会再派生新轮；开场卡内已给出可复制的一条），
-然后回到**当前会话**（默认它就是 planner）`#plan 拆解 <需求>`；要另建 plan 会话加 `--plan-session new`。仅模型 flag（`--planner-model` / `--dev-model` / `--tester-model` / `--reviewer-model`，裸写 `<modelKey>` 亦算）或 `--executor` 算实质 flag，有任一即走老行为直接建会话；单 `--name`（无任何模型/执行器 flag）不跳卡，仍回开场卡并回显已预填的需求名（空轮已建，见上一段）。
+开场卡禁令（逐字）：本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面两项。
+
+拿到答案后重跑带参 `/swarm-up --run <空轮runId> --name <需求名>`（复用本空轮，不会再派生新轮；开场卡内已给出可复制的一条），
+然后回到**当前会话**（默认它就是 planner）`#plan 拆解 <需求>`；要另建 plan 会话加 `--plan-session new`。仅模型 flag（`--dev-model` / `--dev-backend-model` / `--dev-frontend-model` / `--tester-model` / `--reviewer-model`，裸写亦算）或 `--executor` 算实质 flag，有任一即走老行为直接建会话；单 `--name`（无任何模型/执行器 flag）不跳卡，仍回开场卡并回显已预填的需求名（空轮已建，见上一段）。
 
 ---
 
@@ -173,18 +173,18 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 
 **发生了什么（你看不到但确实执行了）：**
 
-1. 插件检测到 `#plan`，把 planner 角色契约注入提示词（只拆不写、必须给 acceptance + verify_cmd + testing、禁 shell 拼接）。
-2. planner 读 prd.md，识别出三条独立战线：后端校验流水、前端弹窗展示、Excel 导入导出。
-3. planner 调 `swarm_read_queue` 查重 → 调 `swarm_plan` 批量入队。
+1. 插件检测到 `#plan`，把 planner 角色契约注入提示词（只拆不写、必须给 acceptance + verify_cmd + testing + stack、禁 shell 拼接）。
+2. planner 读 prd.md，先落成 PRD 文件，识别出三条独立战线：后端校验流水、前端弹窗展示、Excel 导入导出。
+3. planner 调 `swarm_read_queue` 查重 → 调 `swarm_plan` 批量入队（pin `prd` 路径 + `name`）。
 
-**minimal 情况下 planner 应该产出这样的队列**（这也是你该检查的东西，R1 起含 `testing`）：
+**minimal 情况下 planner 应该产出这样的队列**（这也是你该检查的东西，R1 起含 `testing`，本轮起含 `stack`）：
 
 ```json
-{"id":"W1-T1","wave":"W1","title":"后端：开瓶信息成对校验","acceptance":"只填日期或只填人、日期+人但月数空、月数不在1~120 时均返回业务错误","verify_cmd":"go test ./tests/base -run TestOpenInfoValidate","testing":"同 verify_cmd"}
-{"id":"W1-T2","wave":"W1","title":"后端：首次补录写 OpOpen 并置 state=2","acceptance":"open_time 与 open_user_id 均为空且本次填了日期+人 → 写一条 OpOpen；state<2 变 2","verify_cmd":"go test ./tests/base -run TestOpenInfoFirstOps","testing":"同 verify_cmd"}
-{"id":"W1-T3","wave":"W1","title":"后端：非首次与清空只写 OpEdit","acceptance":"非首次修改/清空 → 只写 OpEdit，state 不回退","verify_cmd":"go test ./tests/base -run TestOpenInfoEditOps","testing":"同 verify_cmd"}
-{"id":"W2-T1","wave":"W2","title":"前端：batch-edit 加 showOpenInfo 开关","acceptance":"开关默认 false，其它调用点 DOM 零变化","verify_cmd":"node smarterlab-front/scripts/tsc-gate.mjs","testing":"tsc-gate 快轨空跑"}
-{"id":"W3-T1","wave":"W3","title":"Excel：模板 14 列与导出回填","acceptance":"列序正确；导出按 open_time→expiry 反算月数可精确复现","verify_cmd":"go test ./tests/base -run TestBottleExportOpenInfo","testing":"同 verify_cmd"}
+{"id":"W1-T1","wave":"W1","stack":"backend","title":"后端：开瓶信息成对校验","acceptance":"只填日期或只填人、日期+人但月数空、月数不在1~120 时均返回业务错误","verify_cmd":"go test ./tests/base -run TestOpenInfoValidate","testing":"同 verify_cmd"}
+{"id":"W1-T2","wave":"W1","stack":"backend","title":"后端：首次补录写 OpOpen 并置 state=2","acceptance":"open_time 与 open_user_id 均为空且本次填了日期+人 → 写一条 OpOpen；state<2 变 2","verify_cmd":"go test ./tests/base -run TestOpenInfoFirstOps","testing":"同 verify_cmd"}
+{"id":"W1-T3","wave":"W1","stack":"backend","title":"后端：非首次与清空只写 OpEdit","acceptance":"非首次修改/清空 → 只写 OpEdit，state 不回退","verify_cmd":"go test ./tests/base -run TestOpenInfoEditOps","testing":"同 verify_cmd"}
+{"id":"W2-T1","wave":"W2","stack":"frontend","title":"前端：batch-edit 加 showOpenInfo 开关","acceptance":"开关默认 false，其它调用点 DOM 零变化","verify_cmd":"node smarterlab-front/scripts/tsc-gate.mjs","testing":"tsc-gate 快轨空跑"}
+{"id":"W3-T1","wave":"W3","stack":"integration","title":"Excel：模板 14 列与导出回填","acceptance":"列序正确；导出按 open_time→expiry 反算月数可精确复现","verify_cmd":"go test ./tests/base -run TestBottleExportOpenInfo","testing":"同 verify_cmd"}
 ```
 
 **planner 交付后你要做的检查（30 秒）：**
@@ -193,14 +193,17 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 - 有没有任务混了多件事？`W1-T2` 若同时含"写流水"和"改 Excel"，就该拆开。
 - 有没有任务的 acceptance 是"代码正确"这种无法判定的废话？有就让 planner 重写。
 
-### 第 ② 步：启动流水线（必须显式 start）
+### 第 ② 步：启动流水线（必须显式 start；模型在这里按需分配，缺啥硬拦）
 
 ```
-/swarm-start
+/swarm-start --dev-backend-model opencode-go/deepseek-v4-flash --dev-frontend-model opencode-go/deepseek-v4-flash --tester-model opencode-go/muse-spark-1.3-contributor
 ```
 
 > `/swarm-up` 只开轮**不派发**；plan 入队后如果不 start，dev/test 的 `swarm_claim/swarm_next` 会被闸门拒收
 > （提示「本轮已 plan 未派发」）。这是为了杜绝「没 start 就被子代理抢跑」。
+> 模型按队列实际 stack 按需索要：只含 backend 的轮不要 `--dev-frontend-model`，只含 frontend 的不要
+> `--dev-backend-model`，有评审任务再加 `--reviewer-model`；缺啥 start 直接拒收（门禁硬拦，不清 pendingStart、
+> 不派发），按提示补齐重跑。`swarm_config` 会带出 `stacks`/`missingModels`，一眼看清缺啥。
 
 输出：`已派发 W1-T1（wave=W1）→ dev` + `已唤醒 ses_xxx（dev）→ 该会话开始执行 W1-T1`。
 队列里 `W1-T1` 变 `dev_doing`，通道里出现 `[TASK-ASSIGN] task=W1-T1 ... to=dev`，

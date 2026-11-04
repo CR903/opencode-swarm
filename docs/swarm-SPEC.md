@@ -42,8 +42,8 @@ tag 由插件的 `session.prompt` hook 展开：角色契约 + 任务详情 + �
 
 | 命令 | 作用 |
 |---|---|
-| `/swarm-up --planner-model a/b --dev-model c/d --tester-model e/f [--name 需求名] [--dry-run]` | 先校验模型，再建三会话（agent+model 写进 create，回读核对），并按需求命名 |
-| `/swarm-start [--name 需求名] [--no-wake]` | 派发第一个 queued 任务 + 唤醒 dev 会话 |
+| `/swarm-up [--dev-model c/d --tester-model e/f] [--name 需求名] [--dry-run]` | 开轮只建空轮（模型可在 start 时再给）；带模型 flag 则先校验再建会话并按需求命名 |
+| `/swarm-start [--dev-backend-model b/b --dev-frontend-model f/f --tester-model e/f --reviewer-model r/r] [--name 需求名] [--no-wake]` | 按需模型门禁（缺啥硬拦）→ 派发第一个 queued 任务 + 唤醒 dev 会话 |
 | `/swarm-status` | 轮次名 + 会话表（role/session/title/model/手上任务）+ 队列 + 通道尾 + 卡住的任务 |
 | `/swarm-models [--provider p] [--search q]` | 列可用模型，用于挑 `provider/model` |
 | `/swarm-halt --task X [--reason …]` | 人工熔断 |
@@ -78,7 +78,7 @@ tag 由插件的 `session.prompt` hook 展开：角色契约 + 任务详情 + �
 | 工具 | 谁用 | 动作 |
 |---|---|---|
 | `swarm_read_queue` | 全部 | 读队列（可按 status 筛） |
-| `swarm_plan` | planner | 批量入队（校验必填字段、查重；可选 `review/reviewDepth`） |
+| `swarm_plan` | planner | 批量入队（必填 id/wave/title/acceptance/verify_cmd/testing/**stack** 三选一 backend/frontend/integration、查重；可选 `review/reviewDepth`；可选 `prd` 记 PRD 路径、`name` 命名） |
 | `swarm_claim` | dev | queued → dev_doing（CAS，不双花） |
 | `swarm_next` | dev | 取当前 dev_doing 任务详情 |
 | `swarm_done` | dev | **过门禁**后 → test_doing，发 `[TASK-DONE]` |

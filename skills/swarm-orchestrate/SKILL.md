@@ -24,8 +24,8 @@ description: "主会话自然语言编排 swarm 轮次：人话开工，全程�
 
 | 用户人话 | 意图 | 动作 |
 |---|---|---|
-| "这个 bug 修一下 / 挂了，再看看" | bugfix | `swarm_read_queue` 找命中任务则复用，否则 `swarm_plan` 建单任务 → 问用户「是否 /swarm-start 派发？」（门二）→ 确认后派 dev 会话/子代理开工 → 修完走 `subagent(test)` → 验收通过主会话调 `/swarm-clean` 归档（人不敲命令） |
-| "加个功能 / 改一版 / 来个新需求…" | 新需求 | 先问用户「是否开始 planner？」（门一）→ 确认后小活直接拆、大活开 planner 会议再拆 → `swarm_plan` 批量 → 问用户「是否 /swarm-start 派发？」（门二）→ 确认后按 wave 派 → 每个任务 test pass 后立刻加载 `swarm-quality` 走一遍（先于 reviewer；有 High 回 dev，无问题进 reviewer/drained） |
+| "这个 bug 修一下 / 挂了，再看看" | bugfix | `swarm_read_queue` 找命中任务则复用，否则 `swarm_plan` 建单任务（带 stack）→ 问用户「是否 /swarm-start 派发？」（门二）→ 确认后派 dev 会话/子代理开工 → 修完走 `subagent(test)` → 验收通过主会话调 `/swarm-clean` 归档（人不敲命令） |
+| "加个功能 / 改一版 / 来个新需求…" | 新需求 | 先问用户「是否开始 planner？」（门一）→ 确认后先落 PRD，小活直接拆、大活开 planner 会议再拆 → `swarm_plan` 批量（每项带 stack：backend/frontend/integration，pin prd） → 问用户「是否 /swarm-start 派发？」（门二）→ 确认后按 wave 派 → 每个任务 test pass 后立刻加载 `swarm-quality` 走一遍（先于 reviewer；有 High 回 dev，无问题进 reviewer/drained） |
 | "再测一遍 / 验证下 W1-T1" | 复测 | 派 `subagent(test)`，带 `verify_cmd` + 边界 |
 | "现在啥情况 / 到哪了" | 进度 | 读队列 + timeline，回一句话（做了什么/卡在哪/谁在跑） |
 | "别跑了 / 停 / 回滚重来" | 叫停 | `swarm_halt` 熔断；要重做再 `swarm_revert` |
@@ -39,8 +39,8 @@ description: "主会话自然语言编排 swarm 轮次：人话开工，全程�
 
 ```
 swarm_read_queue 看现状 → 按 §2 分类意图 →
-  bugfix: swarm_read_queue 找命中则复用 else swarm_plan 建单任务 → 问用户「是否 /swarm-start 派发？」（门二，确认后执行；未 start 前认领会被闸门拒）→ dev 会话/子代理开工（prompt=验收+verify_cmd+上次失败史）→ 修完派 subagent(test, model=roleModels.test, prompt=verify_cmd+边界) → test pass 后主会话加载 swarm-quality 走一遍（只建议不拦截；有 High 回 dev，无问题照常往下）→ 再执行 /swarm-clean 归档（人不敲命令，整轮搬运可审计）
-  新需求: 先问用户「是否开始 planner？」（门一）→ 确认后小活直接拆 / 大活开 planner 会议 → swarm_plan 批量 → 问用户「是否 /swarm-start 派发？」（门二）→ 确认后按 wave 派 dev/test → 每个任务 test pass 后立刻加载 swarm-quality 巡检（先于 reviewer；有 High 回 dev，无问题进 reviewer/drained）
+  bugfix: swarm_read_queue 找命中则复用 else swarm_plan 建单任务（带 stack）→ 问用户「是否 /swarm-start 派发？」（门二，确认后执行；未 start 前认领会被闸门拒）→ dev 会话/子代理开工（prompt=验收+verify_cmd+上次失败史）→ 修完派 subagent(test, model=roleModels.test, prompt=verify_cmd+边界) → test pass 后主会话加载 swarm-quality 走一遍（只建议不拦截；有 High 回 dev，无问题照常往下）→ 再执行 /swarm-clean 归档（人不敲命令，整轮搬运可审计）
+  新需求: 先问用户「是否开始 planner？」（门一）→ 确认后先落 PRD，小活直接拆 / 大活开 planner 会议 → swarm_plan 批量（带 stack，pin prd） → 问用户「是否 /swarm-start 派发？」（门二）→ 确认后按 wave 派 dev/test → 每个任务 test pass 后立刻加载 swarm-quality 巡检（先于 reviewer；有 High 回 dev，无问题进 reviewer/drained）
   复测: subagent(test, model=roleModels.test, prompt=verify_cmd+边界)
   进度: 读队列+timeline 报一句话
   叫停: swarm_halt / swarm_revert（tool 版，与命令同逻辑）
@@ -59,11 +59,17 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 - high-risk 任务派 subagent 前先查 approve 行（`swarm_read_queue` 看 timeline 或 status 待批行），无批不派（`swarm_claim` 语义不动，仍可绕过，靠审计威慑）。
 - 确认门见 §1.5（两道门：开轮问 planner，入队问 start；原来“≤3 直接派”作废）。
 
-## 4. 模型映射
+## 4. 模型映射（start 时人工按需分配，门禁硬拦）
 
-- 派发前调 `swarm_config` 读 `{executor, roleModels, currentRun, runId}`。
-- dev 会话唤醒沿用建会话时写入的 `roleModels.dev`（不另传参），test 用 `roleModels.test`，reviewer 用 `roleModels.reviewer`。
-- 缺失只问一次（用 question 工具），问到后重跑带模型的 `/swarm-start` 落盘，后续不再问。
+- 开轮（`/swarm-up`）不定模型；planner 拆任务时每项必带 `stack`（backend/frontend/integration）。
+- 派发前调 `swarm_config` 读 `{executor, roleModels, currentRun, runId, stacks, missingModels}`：
+  `stacks` = 本轮实际出现的 stack，`missingModels` = 缺的模型键（纯 legacy 轮两者皆空）。
+- 分栈取模型：backend 任务的 dev 用 `roleModels.dev_backend`，frontend 用 `roleModels.dev_frontend`
+  （legacy `roleModels.dev` 通配前后端）；test 一律 `roleModels.test`，reviewer 用 `roleModels.reviewer`。
+- dev 会话唤醒沿用建会话时写入的模型（不另传参）；subagent 派发时 `model=` 按上条分栈填写。
+- 缺啥问人要（用 question 工具），问到后重跑带模型的 `/swarm-start` 落盘：
+  `--dev-backend-model p/m --dev-frontend-model p/m --tester-model p/m --reviewer-model p/m` 按需只给要的；
+  未配齐时 `/swarm-start` 直接拒收（门禁硬拦，不用主会话盘点）。
 - subagent 无模型传参则继承父会话模型（官方语义），不写死任何模型名。
 
 ## 5. 四铁律 + 异常升级
