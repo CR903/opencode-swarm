@@ -2282,7 +2282,7 @@ describe('无参 /swarm-up 提问式开场卡（零会话零落盘零队列读�
   let toolsUMap;
   let promptsU;
   let createCount;
-  const BAN_LINE = '本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面三项。';
+  const BAN_LINE = '本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面两项。';
 
   const cmdU = async (name, text = '', sessionID = 's1') => {
     await cmdsU.get(name).execute({ sessionID, prompt: { text } });
@@ -2434,11 +2434,15 @@ describe('无参 /swarm-up 提问式开场卡（零会话零落盘零队列读�
     assert.match(bare, /主会话即 planner/);
     assert.match(bare, /不要自行开始分析需求/);
     assert.doesNotMatch(bare, /然后在 planner 会话里/);
+    assert.doesNotMatch(bare, /--planner-model <p>/, '开场卡不得再教模型 flags（up 不定模型）');
+    assert.doesNotMatch(bare, /问完上面三项/, '两问题卡不得残留三项');
     const named = await cmdU('swarm-up', '--name 确认门卡片');
     assert.match(named, /是否开始 planner？/);
     assert.match(named, /主会话即 planner/);
     assert.match(named, /不要自行开始分析需求/);
     assert.doesNotMatch(named, /然后在 planner 会话里/);
+    assert.doesNotMatch(named, /--dev-model <d>/, '空轮卡下一步不得带模型 flags');
+    assert.match(named, /模型不用现在给/, '空轮卡下一步说清模型去 start');
   });
 
   test('显式 --run 无名建空轮：同回开场卡不派生新轮，落盘可辨非 STALE', async () => {

@@ -1157,7 +1157,7 @@ export default {
             if (skipped.length) lines.push(`跳过：\n${skipped.map((x) => `- ${x}`).join('\n')}`);
             if (missing.length) lines.push(`⚠️ 包内缺失（未安装）：\n${missing.map((x) => `- ${x}`).join('\n')}`);
             lines.push('skills（swarm-orchestrate / swarm-quality）已随插件自动注册，无需复制。');
-            lines.push('下一步：`/swarm-up --planner-model <p> --dev-model <d> --tester-model <t> --name <需求名>`，然后先问用户是否开始 planner，确认后在本会话 `#plan 拆解 <需求>`。');
+            lines.push('下一步：`/swarm-up --name <需求名>`（只给需求名，不定模型；模型留到 `/swarm-start` 时按需分配），然后先问用户是否开始 planner，确认后在本会话 `#plan 拆解 <需求>`。');
             return reply(lines.join('\n\n'));
           } catch (e) {
             return reply(`❌ /swarm-init 异常：${oneLine(e?.message ?? e, 200)}`);
@@ -1304,8 +1304,8 @@ export default {
                   '2. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。\n' +
                   '模型说明：开轮不定模型。planner 拆完任务后，在 `/swarm-start` 时按实际 stack 按需分配（backend 要 `--dev-backend-model`，frontend 要 `--dev-frontend-model`，另需 `--tester-model`，有评审任务再加 `--reviewer-model`；legacy `--dev-model` 可通配前后端）。缺啥门禁硬拦，不用现在定；查模型：`/swarm-models --search <关键词>`。\n' +
                   '评审默认值：medium/high 默认进评审（test pass 后进 reviewing），low 默认直通（显式 review:true 可开，显式 review:false 可关）。\n\n' +
-                  '本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面三项。\n\n' +
-                  `下一步：拿到答案后重跑带参 \`/swarm-up --run ${upRun} --planner-model <p> --dev-model <d> --tester-model <t>${upName ? ` --name ${upName}` : ''}\`（复用本空轮，不会再派生新轮；模型不用现在给，start 时按需分配），然后先问用户「是否开始 planner？」——得到确认后，在本会话（主会话即 planner，不再另建 plan 会话）里 \`#plan 拆解 <需求>\`，不要自行开始分析需求。`,
+                  '本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面两项。\n\n' +
+                  `下一步：拿到答案后重跑带参 \`/swarm-up --run ${upRun}${upName ? ` --name ${upName}` : ''}\`（复用本空轮，不会再派生新轮；模型不用现在给，start 时按需分配），然后先问用户「是否开始 planner？」——得到确认后，在本会话（主会话即 planner，不再另建 plan 会话）里 \`#plan 拆解 <需求>\`，不要自行开始分析需求。`,
                 );
               }
               const upNameBare = upName;
@@ -1317,7 +1317,7 @@ export default {
                 '2. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。\n' +
                 '模型说明：开轮不定模型。planner 拆完任务后，在 `/swarm-start` 时按实际 stack 按需分配（backend 要 `--dev-backend-model`，frontend 要 `--dev-frontend-model`，另需 `--tester-model`，有评审任务再加 `--reviewer-model`；legacy `--dev-model` 可通配前后端）。缺啥门禁硬拦，不用现在定；查模型：`/swarm-models --search <关键词>`。\n' +
                 '评审默认值：medium/high 默认进评审（test pass 后进 reviewing），low 默认直通（显式 review:true 可开，显式 review:false 可关）。\n\n' +
-                '本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面三项。\n\n' +
+                '本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面两项。\n\n' +
                 '下一步：拿到答案后重跑带参 `/swarm-up --name <需求名>`（只补需求名，不定模型），然后先问用户「是否开始 planner？」——得到确认后，在本会话（主会话即 planner，不再另建 plan 会话）里 `#plan 拆解 <需求>`，不要自行开始分析需求。',
               );
             }
