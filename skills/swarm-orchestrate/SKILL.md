@@ -77,6 +77,11 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 - 缺啥问人要（用 question 工具），问到后重跑带模型的 `/swarm-start` 落盘：
   `--dev-backend-model p/m --dev-frontend-model p/m --tester-model p/m --reviewer-model p/m` 按需只给要的；
   未配齐时 `/swarm-start` 直接拒收（门禁硬拦，不用主会话盘点）。
+- **思考强度（`provider/model#variant`）**：swarm 只定身份（用哪个模型），强度走官方 variants
+ （写法 `p/m#high`，`roleModels` 存完整串透传到底；错强度门禁拒收并列出可用项；不写=模型默认）。
+  默认建议（按需覆盖，以省 cost 为先）：planner `#high`（拆得准，次数少，值得）、
+  dev `#low`（量大便宜；难啃的单任务可单独 `#high`）、test `#low`（只跑命令+grep）、
+  reviewer `#high`（抓 bug 靠它）。`/swarm-models` 可查各模型可用强度。
 - subagent 无模型传参则继承父会话模型（官方语义），不写死任何模型名。
 
 ## 5. 六铁律 + 异常升级

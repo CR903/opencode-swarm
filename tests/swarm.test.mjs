@@ -1873,3 +1873,41 @@ describe('R2 stack required（backend/frontend/integration 三选一）', () => 
     assert.deepEqual(done.missing, [], '已 passed 不再索要模型');
   });
 });
+
+describe('R3 思考强度 variant（provider/model#variant）', () => {
+  const stubCtx = (models) => ({ model: { list: async () => models } });
+  const REG = [
+    { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek', variants: [{ id: 'low' }, { id: 'high' }, { id: 'max' }] },
+    { providerID: 'opencode-go', id: 'plain-model', name: 'Plain' },
+  ];
+
+  test('splitModel：无#零变；有#拆 variant；空/双#拒收', async () => {
+    const { splitModel } = await import('../plugins/swarm.js');
+    assert.deepEqual(splitModel('opencode-go/deepseek-v4.1-flash'), { providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
+    assert.deepEqual(splitModel('opencode-go/deepseek-v4.1-flash#high'), { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', variant: 'high' });
+    assert.equal(splitModel('opencode-go/deepseek-v4.1-flash#'), null);
+    assert.equal(splitModel('opencode-go/deepseek-v4.1-flash#a#b'), null);
+    assert.equal(splitModel('nonsense'), null);
+  });
+
+  test('modelIndex 保留 variants；resolveModelRef 校验强度', async () => {
+    const { modelIndex, resolveModelRef } = await import('../lib/swarm-sessions.js');
+    const index = await modelIndex(stubCtx(REG));
+    assert.deepEqual(index.byRef.get('opencode-go/deepseek-v4.1-flash').variants, [{ id: 'low' }, { id: 'high' }, { id: 'max' }]);
+    const ok = resolveModelRef(index, { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', variant: 'high' });
+    assert.equal(ok.ok, true);
+    assert.equal(ok.variant, 'high');
+    const normed = resolveModelRef(index, { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', variant: 'HIGH' });
+    assert.equal(normed.ok, true);
+    assert.equal(normed.variant, 'high');
+    const bad = resolveModelRef(index, { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', variant: 'ultra' });
+    assert.equal(bad.ok, false);
+    assert.ok(bad.suggestions.some((s) => s === 'opencode-go/deepseek-v4.1-flash#high'), '错强度要列出可用项');
+    const novar = resolveModelRef(index, { providerID: 'opencode-go', id: 'plain-model', variant: 'high' });
+    assert.equal(novar.ok, false);
+    assert.ok(novar.suggestions.includes('opencode-go/plain-model'), '无 variants 的模型指回裸引用');
+    const plain = resolveModelRef(index, { providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
+    assert.equal(plain.ok, true);
+    assert.equal(plain.variant, undefined, '不带强度不加字段（老行为零变）');
+  });
+});

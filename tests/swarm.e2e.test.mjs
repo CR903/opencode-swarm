@@ -73,8 +73,8 @@ before(async () => {
     // 模型注册表：两个可用模型；'opencode-go/retired-model' 故意不存在
     model: {
       list: async () => [
-        { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
-        { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark' },
+        { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', variants: [{ id: 'low' }, { id: 'high' }, { id: 'max' }] },
+        { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark', variants: [{ id: 'minimal' }, { id: 'low' }, { id: 'medium' }, { id: 'high' }, { id: 'xhigh' }] },
       ],
     },
     session: {
@@ -1662,8 +1662,8 @@ describe('start 失败零落盘（校验前置）', () => {
       options: { channel: 'swarm-cleanfail', maxRetries: 3, verifyTimeoutMs: 20_000 },
       model: {
         list: async () => [
-          { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
-          { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark' },
+          { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', variants: [{ id: 'low' }, { id: 'high' }, { id: 'max' }] },
+          { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark', variants: [{ id: 'minimal' }, { id: 'low' }, { id: 'medium' }, { id: 'high' }, { id: 'xhigh' }] },
         ],
       },
       session: {
@@ -2351,8 +2351,8 @@ describe('无参 /swarm-up 提问式开场卡（零会话零落盘零队列读�
       options: { channel: 'swarm-noargup', maxRetries: 3, verifyTimeoutMs: 20_000 },
       model: {
         list: async () => [
-          { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
-          { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark' },
+          { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', variants: [{ id: 'low' }, { id: 'high' }, { id: 'max' }] },
+          { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark', variants: [{ id: 'minimal' }, { id: 'low' }, { id: 'medium' }, { id: 'high' }, { id: 'xhigh' }] },
         ],
       },
       session: {
@@ -4243,5 +4243,99 @@ describe('冻结线：/swarm-freeze 锁死入队，hotfix 例外（w6 无终点�
       tasks: [{ id: 'FZ-T1', wave: 'W1', stack: 'backend', title: '新功能', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false }],
     });
     assert.match(back, /FZ-T1: queued/);
+  });
+});
+
+describe('思考强度 variant（#high 透传：校验→落盘→建会话→回读）', () => {
+  const M1 = 'opencode-go/deepseek-v4.1-flash';
+  let dirV;
+  let runV;
+  let cmdV;
+  const sessionsV = new Map();
+
+  before(async () => {
+    dirV = mkdtempSync(join(tmpdir(), 'swarm-variant-'));
+    writeFileSync(join(dirV, 'ok.mjs'), 'process.exit(0);\n');
+    const promptsV = [];
+    const toolsV = new Map();
+    const cmdsV = new Map();
+    let seq = 0;
+    const ctxV = {
+      location: { directory: dirV },
+      options: { channel: 'swarm-variant-e2e', maxRetries: 3, verifyTimeoutMs: 20_000 },
+      model: {
+        list: async () => [
+          { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', variants: [{ id: 'low' }, { id: 'high' }, { id: 'max' }] },
+          { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark', variants: [{ id: 'minimal' }, { id: 'low' }, { id: 'medium' }, { id: 'high' }, { id: 'xhigh' }] },
+        ],
+      },
+      session: {
+        prompt: async ({ sessionID, text }) => { promptsV.push(`[${sessionID}] ${text}`); },
+        create: async ({ title, agent, model }) => {
+          const id = `var-${++seq}`;
+          sessionsV.set(id, { id, title, agent, model });
+          return { id, title };
+        },
+        get: async ({ sessionID }) => sessionsV.get(sessionID),
+        update: async () => {},
+        switchModel: async () => {},
+        hook: async () => {},
+      },
+      command: { transform: async (fn) => fn({ add: (d) => cmdsV.set(d.name, d) }) },
+      tool: { transform: async (fn) => fn({ add: (d) => toolsV.set(d.name, d) }) },
+    };
+    await plugin.setup(ctxV);
+    runV = async (name, input) => (await toolsV.get(name).execute(input)).content;
+    cmdV = async (name, text = '', sessionID = 's1') => {
+      await cmdsV.get(name).execute({ sessionID, prompt: { text } });
+      return promptsV.at(-1);
+    };
+  });
+
+  after(() => { rmSync(dirV, { recursive: true, force: true }); });
+
+  test('up 带 #high：报告/落盘/建会话/回读全透传', async () => {
+    const out = await cmdV('swarm-up', `--run VAR1 --name 强度透传 --dev-model ${M1}#high --executor sessions`);
+    assert.match(out, /deepseek-v4\.1-flash#high/);
+    const meta = JSON.parse(readFileSync(join(dirV, '.swarm/runs/VAR1/meta.json'), 'utf8'));
+    assert.equal(meta.roleModels.dev, `${M1}#high`, 'roleModels 存完整串');
+    const round = JSON.parse(readFileSync(join(dirV, '.swarm/runs/VAR1/round.json'), 'utf8'));
+    const devSid = round.sessions.dev;
+    assert.ok(devSid, 'dev 会话已建');
+    assert.equal(sessionsV.get(devSid).model.variant, 'high', 'create 透传 variant');
+    assert.doesNotMatch(out, /与要求不一致/, '回读核对（含强度）通过');
+  });
+
+  test('错强度拒收并列出可用项；空强度算格式错', async () => {
+    const bad = await cmdV('swarm-up', `--run VARBAD --dev-model ${M1}#ultra`);
+    assert.match(bad, /没有强度/);
+    assert.match(bad, /deepseek-v4\.1-flash#high/);
+    assert.match(bad, /deepseek-v4\.1-flash#low/);
+    assert.equal(existsSync(join(dirV, '.swarm/runs/VARBAD/meta.json')), false, '拒收零落盘');
+    const empty = await cmdV('swarm-up', '--run VARBAD --dev-model opencode-go/deepseek-v4.1-flash#');
+    assert.match(empty, /格式不对/);
+  });
+
+  test('start 模型 flag 照收完整串（门禁只查存在性，强度由 up/start 校验口径管）', async () => {
+    await runV('swarm_plan', {
+      run: 'VARSTART',
+      tasks: [{ id: 'VS-T1', wave: 'W1', stack: 'backend', title: '强度门禁', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false }],
+    });
+    const out = await cmdV('swarm-start', `--run VARSTART --dev-backend-model ${M1}#high --tester-model opencode-go/muse-spark-1.3-contributor#low`);
+    assert.match(out, /已派发 VS-T1/);
+    const meta = JSON.parse(readFileSync(join(dirV, '.swarm/runs/VARSTART/meta.json'), 'utf8'));
+    assert.equal(meta.roleModels.dev_backend, `${M1}#high`);
+    assert.equal(meta.roleModels.test, 'opencode-go/muse-spark-1.3-contributor#low');
+  });
+
+  test('/swarm-models 展示可用强度', async () => {
+    const out = await cmdV('swarm-models', '--search deepseek');
+    assert.match(out, /强度/);
+    assert.match(out, /low\/high\/max/);
+  });
+
+  test('开场卡注明免搜 skill（up 两问自包含）', async () => {
+    const out = await cmdV('swarm-up', '');
+    assert.match(out, /不需要加载任何 skill/);
   });
 });

@@ -208,6 +208,9 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 > 不派发），按提示补齐重跑。`swarm_config` 会带出 `stacks`/`missingModels`，一眼看清缺啥。
 > 空轮报"队列已空"时若有同名显示名的非空轮，start 会直接指路（用 `--run <runId>` 重跑）。
 > high-risk 多单批量放行：`swarm_approve` 支持 `task_ids` 数组（原子语义：先验后写）。
+> 思考强度：模型 flag 值可带 `#variant`（如 `--dev-backend-model opencode-go/deepseek-v4.1-flash#high`），
+> 错强度门禁拒收并列出可用项；不写=模型默认。swarm 只定身份不定强度——强度由服务端按 variant 落子，
+> 默认建议 planner high、dev low、test low、reviewer high（`/swarm-models` 可查各模型可用强度）。
 > 冻结线：PRD 全绿后 `/swarm-freeze --run <id> --reason <一句话>` 锁死入队（`swarm_plan` 拒收新任务，
 > hotfix:true 单任务例外）；收尾轮只收 Nit、不开新任务，out-of-scope 只登记；解冻 `/swarm-unfreeze --run <id>`。
 > 三笔账规避：acceptance 必须枚举对称路径（读写删/通过驳回），reviewer 先 grep 全仓再判复用，dev 先找后写。

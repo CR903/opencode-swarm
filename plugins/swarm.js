@@ -203,11 +203,23 @@ function parseFlags(text) {
   return out;
 }
 
-function splitModel(ref) {
+export function splitModel(ref) {
   const raw = String(ref ?? '').trim().replace(/^["']|["']$/g, '');
   if (!raw || !raw.includes('/')) return null;
   const i = raw.indexOf('/');
-  return { providerID: raw.slice(0, i).trim(), id: raw.slice(i + 1).trim() };
+  const providerID = raw.slice(0, i).trim();
+  let id = raw.slice(i + 1).trim();
+  let variant;
+  // 强度后缀（官方 `provider/model#variant` 写法）：第一个 # 之后为 variant，
+  // 空 variant 或第二个 # 视为格式错误（与 Model.parse 同口径）。
+  const h = id.indexOf('#');
+  if (h !== -1) {
+    variant = id.slice(h + 1).trim();
+    id = id.slice(0, h).trim();
+    if (!variant || variant.includes('#')) return null;
+  }
+  if (!providerID || !id || providerID.includes('#')) return null;
+  return { providerID, id, ...(variant ? { variant } : {}) };
 }
 
 /** 会话名/模型落盘前统一脱敏，避免把一整段需求塞进标题。 */
@@ -1046,7 +1058,7 @@ export default {
           for (const { role, ref } of pending) {
             const parsed = splitModel(ref);
             if (!parsed) {
-              problems.push(`- **${role}**：\`${ref}\` 格式不对，应写成 \`provider/model\`（例如 \`opencode-go/deepseek-v4.1-flash\`）`);
+              problems.push(`- **${role}**：\`${ref}\` 格式不对，应写成 \`provider/model\`（可选带强度 \`provider/model#variant\`，例如 \`opencode-go/deepseek-v4.1-flash#high\`）`);
               continue;
             }
             const r = resolveModelRef(index, parsed);
@@ -1367,6 +1379,7 @@ export default {
                   stateLine +
                   (upName ? `\n需求名已预填：**${upName}**（第 1 问直接用它，不用重问）\n` : '') + '\n' +
                   '用 question 工具问清下面两项（括号里是默认值，不答就按默认走）：\n\n' +
+                  '（直接用 question 工具问，不需要加载任何 skill：本卡自包含，开轮两问+开始确认都在上面。）\n\n' +
                   '1. 需求：本轮需求名（一句话）＋ 需求正文去处（prd 路径，或直接口述；planner 阶段会落成 PRD 再按 backend/frontend/integration 拆任务）。\n' +
                   '2. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。\n' +
                   '模型说明：开轮不定模型。planner 拆完任务后，在 `/swarm-start` 时按实际 stack 按需分配（backend 要 `--dev-backend-model`，frontend 要 `--dev-frontend-model`，另需 `--tester-model`，有评审任务再加 `--reviewer-model`；legacy `--dev-model` 可通配前后端）。缺啥门禁硬拦，不用现在定；查模型：`/swarm-models --search <关键词>`。\n' +
@@ -1380,6 +1393,7 @@ export default {
                 '## swarm-up：开轮只建空轮（未创建任何会话，模型不在这里定）\n' +
                 (upNameBare ? `\n需求名已预填：**${upNameBare}**（第 1 问直接用它，不用重问）\n` : '') + '\n' +
                 '用 question 工具问清下面两项（括号里是默认值，不答就按默认走）：\n\n' +
+                  '（直接用 question 工具问，不需要加载任何 skill：本卡自包含，开轮两问+开始确认都在上面。）\n\n' +
                 '1. 需求：本轮需求名（一句话）＋ 需求正文去处（prd 路径，或直接口述；planner 阶段会落成 PRD 再按 backend/frontend/integration 拆任务）。\n' +
                 '2. 执行器：sessions | subagents | hybrid（默认 hybrid：dev常驻会话，test/reviewer走子代理；recipe 见 `/swarm-mode`）。\n' +
                 '模型说明：开轮不定模型。planner 拆完任务后，在 `/swarm-start` 时按实际 stack 按需分配（backend 要 `--dev-backend-model`，frontend 要 `--dev-frontend-model`，另需 `--tester-model`，有评审任务再加 `--reviewer-model`；legacy `--dev-model` 可通配前后端）。缺啥门禁硬拦，不用现在定；查模型：`/swarm-models --search <关键词>`。\n' +
@@ -1422,7 +1436,7 @@ export default {
               if (!ref) { chosen.set(role, null); continue; }
               const parsed = splitModel(ref);
               if (!parsed) {
-                problems.push(`- **${role}**：\`${ref}\` 格式不对，应写成 \`provider/model\`（例如 \`opencode-go/deepseek-v4.1-flash\`）`);
+                problems.push(`- **${role}**：\`${ref}\` 格式不对，应写成 \`provider/model\`（可选带强度 \`provider/model#variant\`，例如 \`opencode-go/deepseek-v4.1-flash#high\`）`);
                 continue;
               }
               const r = resolveModelRef(index, parsed);
@@ -1430,7 +1444,7 @@ export default {
                 const hint = r.suggestions?.length ? `\n  你是不是想用：${r.suggestions.map((s) => `\`${s}\``).join(' / ')}` : '';
                 problems.push(`- **${role}**：${r.reason}${hint}`);
               } else {
-                chosen.set(role, { providerID: r.providerID, id: r.id });
+                chosen.set(role, { providerID: r.providerID, id: r.id, ...(r.variant ? { variant: r.variant } : {}) });
               }
             }
             if (problems.length) {
@@ -1514,12 +1528,13 @@ export default {
               let actual = null;
               try { actual = await ctx.session.get({ sessionID: sid }); } catch { /* 读不到就按未核对处理 */ }
               const gotModel = actual?.model;
-              const modelOk = !model || (gotModel?.providerID === model.providerID && gotModel?.id === model.id);
+              const modelOk = !model || (gotModel?.providerID === model.providerID && gotModel?.id === model.id && (!model.variant || gotModel?.variant === model.variant));
               const gotAgent = actual?.agent;
               const agentOk = !def.agent || !gotAgent || gotAgent === def.agent;
-              const shown = model ? `${model.providerID}/${model.id}` : (gotModel ? `${gotModel.providerID}/${gotModel.id}` : '默认模型');
+              const fmtRef = (m) => (!m ? '(空)' : `${m.providerID}/${m.id}${m.variant ? `#${m.variant}` : ''}`);
+              const shown = model ? fmtRef(model) : (gotModel ? fmtRef(gotModel) : '默认模型');
               const flags = [modelOk ? '✓' : '⚠️', agentOk ? '' : '⚠️ agent'].filter(Boolean).join(' ');
-              const warn = modelOk ? '' : `\n  ⚠️ 实际模型是 ${gotModel ? `${gotModel.providerID}/${gotModel.id}` : '(空)'}，与要求不一致`;
+              const warn = modelOk ? '' : `\n  ⚠️ 实际模型是 ${fmtRef(gotModel)}，与要求不一致`;
               // 给会话挂一条 context 说明（不触发模型调用）：打开这个会话就知道自己是谁、在等什么
               try {
                 await ctx.session.instructions?.entry?.put?.({
@@ -2188,7 +2203,7 @@ export default {
               .filter((m) => (!provider || m.providerID === provider))
               .filter((m) => (!q || `${m.providerID}/${m.id}/${m.name}`.toLowerCase().includes(q)))
               .slice(0, 40)
-              .map((m) => `- \`${m.providerID}/${m.id}\`${m.name && m.name !== m.id ? ` — ${oneLine(m.name, 40)}` : ''}`);
+              .map((m) => `- \`${m.providerID}/${m.id}\`${m.name && m.name !== m.id ? ` — ${oneLine(m.name, 40)}` : ''}${Array.isArray(m.variants) && m.variants.length ? `（强度：${m.variants.join('/')}，写法 \`provider/model#强度\`）` : ''}`);
             const total = index.entries.length;
             return reply(`## swarm-models\n共 ${total} 个可用模型${provider ? `（provider=${provider}）` : ''}${q ? `（含 "${q}"）` : ''}\n\n` +
               `${rows.join('\n') || '（没有匹配）'}\n\n用法：\`/swarm-up --planner-model <provider/model> --dev-model <provider/model> --tester-model <provider/model> --name 需求名\``);
