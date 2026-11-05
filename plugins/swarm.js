@@ -2064,6 +2064,71 @@ export default {
       });
 
       editor.add({
+        name: 'swarm-freeze',
+        description: '冻结本轮：PRD 全绿后锁死入队（swarm_plan 拒收新任务，hotfix:true 例外）；幂等',
+        execute: async ({ sessionID, prompt }) => {
+          const reply = (text) => ctx.session.prompt({ sessionID, text });
+          try {
+            const f = parseFlags(prompt.text ?? '');
+            const runId = cmdRunFor(f, sessionID);
+            const reason = oneLine(f.reason ?? f.why ?? '', 120);
+            let prev = null;
+            try { prev = readMeta(cwd, runId) ?? {}; } catch { prev = {}; }
+            if (prev && prev.frozen === true) {
+              return reply(`本轮 **${runId}** 已处于冻结（${prev.frozenAt ?? '-'} by ${prev.frozenBy ?? '-'}：${prev.frozenReason ?? '-'}），重复 freeze 不写行`);
+            }
+            const at = new Date().toISOString();
+            const by = (typeof sessionID === 'string' && sessionID.trim()) ? sessionID.trim() : 'human';
+            try { writeMeta(cwd, runId, { frozen: true, frozenAt: at, frozenBy: by, frozenReason: reason || '-' }); } catch (e) {
+              return reply(`❌ /swarm-freeze 写 meta 失败：${oneLine(e?.message ?? e, 120)}`);
+            }
+            try {
+              appendTimeline(timelineFor(runId), {
+                taskId: null, kind: 'freeze', from: null, to: null,
+                by, reason: reason || 'freeze', commit: '-', retries: 0,
+                patch: { frozen: true }, ts: at,
+              });
+            } catch { /* timeline 写失败不挡冻结 */ }
+            return reply(`✅ 本轮 **${runId}** 已冻结${reason ? `（${reason}）` : ''}：swarm_plan 拒收一切新任务（hotfix:true 单任务例外）；解冻 /swarm-unfreeze --run ${runId}`);
+          } catch (e) {
+            return reply(`❌ /swarm-freeze 异常：${oneLine(e?.message ?? e, 200)}`);
+          }
+        },
+      });
+
+      editor.add({
+        name: 'swarm-unfreeze',
+        description: '解冻本轮：恢复 swarm_plan 入队；幂等，未冻结轮直接回无需解冻',
+        execute: async ({ sessionID, prompt }) => {
+          const reply = (text) => ctx.session.prompt({ sessionID, text });
+          try {
+            const f = parseFlags(prompt.text ?? '');
+            const runId = cmdRunFor(f, sessionID);
+            let prev = null;
+            try { prev = readMeta(cwd, runId) ?? {}; } catch { prev = {}; }
+            if (!prev || prev.frozen !== true) {
+              return reply(`本轮 **${runId}** 未冻结，无需解冻（swarm_plan 照常入队）`);
+            }
+            const at = new Date().toISOString();
+            const by = (typeof sessionID === 'string' && sessionID.trim()) ? sessionID.trim() : 'human';
+            try { writeMeta(cwd, runId, { frozen: false, frozenAt: at, frozenBy: by }); } catch (e) {
+              return reply(`❌ /swarm-unfreeze 写 meta 失败：${oneLine(e?.message ?? e, 120)}`);
+            }
+            try {
+              appendTimeline(timelineFor(runId), {
+                taskId: null, kind: 'unfreeze', from: null, to: null,
+                by, reason: 'unfreeze', commit: '-', retries: 0,
+                patch: { frozen: false }, ts: at,
+              });
+            } catch { /* timeline 写失败不挡解冻 */ }
+            return reply(`✅ 本轮 **${runId}** 已解冻：swarm_plan 恢复入队`);
+          } catch (e) {
+            return reply(`❌ /swarm-unfreeze 异常：${oneLine(e?.message ?? e, 200)}`);
+          }
+        },
+      });
+
+      editor.add({
         name: 'swarm-migrate',
         description: '一次性迁移：旧全局队列/台账/事件拷入某 run（幂等，目标非空拒绝，需 --force）',
         execute: async ({ sessionID, prompt }) => {
@@ -2280,7 +2345,7 @@ export default {
 
       editor.add({
         name: 'swarm_plan',
-        description: 'planner 专用：批量入队任务（每项必须含 id/wave/title/acceptance/verify_cmd/testing/stack，testing 非空可写"同 verify_cmd"，stack 三选一 backend/frontend/integration）；name 给本轮需求命名；prd 传 PRD 路径（记入 meta 备查）',
+        description: 'planner 专用：批量入队任务（每项必须含 id/wave/title/acceptance/verify_cmd/testing/stack，testing 非空可写"同 verify_cmd"，stack 三选一 backend/frontend/integration）；name 给本轮需求命名；prd 传 PRD 路径（记入 meta 备查）；frozen 轮拒收（hotfix:true 单任务放行）',
         input: {
           type: 'object',
           properties: { tasks: { type: 'array', items: { type: 'object' } }, name: { type: 'string' }, prd: { type: 'string' }, ...S },
@@ -2297,12 +2362,29 @@ export default {
             const prev = loadQueue(qp);
             existingCount = Array.isArray(prev) ? prev.length : 0;
           } catch { existingCount = 0; }
+          // 冻结线（w6 无终点复盘）：frozen 轮拒收一切新任务，hotfix:true 单任务例外放行。
+          // 拒收零写行（含 timeline 无 create）；enqueued=0 时命名逻辑自然不改名。
+          let frozen = null;
+          try {
+            const m = readMeta(cwd, runId) ?? {};
+            if (m.frozen === true) frozen = m;
+          } catch { frozen = null; }
           const results = [];
           let enqueued = 0;
           for (const row of input.tasks ?? []) {
+            if (frozen && row?.hotfix !== true) {
+              results.push(`${row.id ?? '?'}: frozen（本轮已冻结，拒收）`);
+              continue;
+            }
             const r = enqueueTask(qp, row, timelineFor(runId), { by: 'plan', reason: 'create' });
             if (r.ok) enqueued += 1;
-            results.push(`${row.id ?? '?'}: ${r.ok ? 'queued' : r.reason}`);
+            results.push(`${row.id ?? '?'}: ${r.ok ? (row?.hotfix === true ? 'queued (HOTFIX)' : 'queued') : r.reason}`);
+          }
+          if (frozen) {
+            const fAt = frozen.frozenAt ?? '-';
+            const fBy = frozen.frozenBy ?? '-';
+            const fWhy = frozen.frozenReason ?? '-';
+            results.push(`⛔ 本轮已冻结（${fAt} by ${fBy}：${fWhy}）：新任务拒收，hotfix 请带 hotfix:true 单独入队；解冻 /swarm-unfreeze --run ${runId}`);
           }
           invalidate(qp);
           // 命名只认显式 name：从「第一个任务标题」猜需求名会把无关的旧任务名带进来

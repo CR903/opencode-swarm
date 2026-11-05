@@ -79,6 +79,8 @@ tag 由插件的 `session.prompt` hook 展开：角色契约 + 任务详情 + �
 |---|---|---|
 | `swarm_read_queue` | 全部 | 读队列（可按 status 筛） |
 | `swarm_plan` | planner | 批量入队（必填 id/wave/title/acceptance/verify_cmd/testing/**stack** 三选一 backend/frontend/integration、查重；可选 `review/reviewDepth`；可选 `prd` 记 PRD 路径、`name` 命名） |
+| `/swarm-freeze --run <id> [--reason]` | 人工 | 冻结本轮：`swarm_plan` 拒收一切新任务（hotfix:true 例外）；meta+timeline 留痕；幂等 |
+| `/swarm-unfreeze --run <id>` | 人工 | 解冻：恢复入队；未冻结轮直接回无需解冻 |
 | `swarm_claim` | dev | queued → dev_doing（CAS，不双花） |
 | `swarm_next` | dev | 取当前 dev_doing 任务详情 |
 | `swarm_done` | dev | **过门禁**后 → test_doing，发 `[TASK-DONE]` |

@@ -20,6 +20,13 @@ description: "主会话自然语言编排 swarm 轮次：人话开工，全程�
 - **门一（开轮 → planner）**：轮子刚建好（空轮/新轮、队列为空）时，先输出 round 名 + 已知信息摘要，然后问用户：「是否开始 planner？（#plan 输入具体需求/探索，分解成任务）」——得到确认才 `#plan`/拆解；**不要自行开始分析需求**。
 - **门二（入队 → start）**：`swarm_plan` 入队后，一律输出任务映射表（任务 id/标题/risk/verify_cmd 一览），然后问用户：「是否 /swarm-start 派发？」——得到确认才执行 `/swarm-start`；大小活一视同仁，原来“≤3 直接派”作废。
 
+## 1.6 冻结线（收尾不发散，人拍板才冻）
+
+- **冻法**：PRD 验收全绿后，问用户「是否冻结本轮？」——确认才执行 `/swarm-freeze --run <id> --reason <一句话>`；冻后 `swarm_plan` 拒收一切新任务（hotfix:true 单任务例外，照常审计）。
+- **收尾轮纪律**：只收 Nit，不开新任务（没有 wN-T5）；够 Important 的当场二选一——独立 hotfix（人批）或 debt backlog（wontfix+reason）；out-of-scope findings 只登记不 block。
+- **停信号**（两个都绿才收，不绿就继续是错的）：① PRD 验收全绿；② 新发现仍在原始模块内。出模块的发现只登记，由人批量拍板开不开新任务。
+- **解冻**：冻错/漏 hotfix 时 `/swarm-unfreeze --run <id>`（timeline 留痕，可审计）。
+
 ## 2. 意图表
 
 | 用户人话 | 意图 | 动作 |
@@ -72,13 +79,15 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
   未配齐时 `/swarm-start` 直接拒收（门禁硬拦，不用主会话盘点）。
 - subagent 无模型传参则继承父会话模型（官方语义），不写死任何模型名。
 
-## 5. 五铁律 + 异常升级
+## 5. 六铁律 + 异常升级
 
 1. **接管宣告**：开工先说一句"我来编排本轮（run=<id>），全程代跑，有事叫你"，再调工具。
 2. **派发必带验收标准 + verify_cmd**：每个 subagent prompt 必须含任务的 `acceptance` 与 `verify_cmd`（+ 失败史），缺一律不派。
 3. **叫停即 halt 重排**：用户喊停先 `swarm_halt` 熔断，再问是 retry 还是 revert，不硬修。
 4. **两道门都必须等人回话**：开轮后问 planner（门一），入队后问 start（门二）；不代跑、不脑补、不跳过。
 5. **只有持轮会话派单**：claim/done/test/review 回执首行带 `run=`，派之前先对轮——别在 A 轮的会话里派 B 轮的活（串轮事故就是这么来的）。
+
+6. **三笔账规避（返工税）**：planner 拆任务时 acceptance 必须枚举对称路径（读写删三端、通过/驳回两分支——“只修一半”死在这）；reviewer 出结论前先 grep 全仓同类实现（有现成 helper 而新写一套→Important 打回——“两处各写一套”死在这）；dev 动手前先找后写。口径没写就是流程的债，不记模型的账。
 
 异常升级：HALT 已有推送（requester 会收到"⛔ HALT 通知 … 恢复：/swarm-retry --task X"），
 收到即停轮询、原话转述给用户，等拍板；高风险任务（`risk=high` 或命中 `sensitivePaths`）

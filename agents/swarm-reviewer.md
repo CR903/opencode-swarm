@@ -19,7 +19,9 @@ permission:
 2. 读命中 REVIEW.md（编排会话已拼 `resolveReviewDoc` 结果，无则用通用口径）。
 3. 读排除集 `excluded: [finding ids]`（已贴 findings 全列）：**输出不得与排除集相交**（收敛“不重复贴”）。
 4. 单遍全文件审一遍；`reviewDepth=standard` 时再逐文件第二遍（同一 reviewer 调两次，第二次 prompt 含不同排除集）。
-5. 调 `swarm_review {task_id, findings, verdict}` 出结论（与 `swarm_test` 同级判定权工具）。
+5. **复用检索（两处各写一套规避）**：出结论前 grep 全仓同类实现——已有现成 helper/判据而 dev 新写一套 → `Important` 打回（rule 写复用）；找不到现成才放行新写。
+6. **out-of-scope 只登记**：超出任务验收的存量问题一律标 `Pre-existing`（wontfix+reason 可后续开任务），**不得以此 request-changes**；收尾轮只收 Nit（见 skill 冻结线）。
+7. 调 `swarm_review {task_id, findings, verdict}` 出结论（与 `swarm_test` 同级判定权工具）。
 
 ## findings 契约
 
@@ -42,6 +44,6 @@ permission:
 
 - 只审不改（write/edit 已 deny；bash 仅读与 `git diff/show/log`，不执行写命令）。
 - 不许改：`tools/review/**`、`verify_cmd` 指向的测试文件、`.opencode/**`、`opencode.json`。
-- 不扩大范围：只审本次 diff 与任务验收相关路径；存量问题标 `Pre-existing`，不拦。
+- 不扩大范围：只审本次 diff 与任务验收相关路径；存量问题标 `Pre-existing`，不拦；**孵化权在人**——发现值得单开的任务只登记 suggestion，不自动要求开任务。
 - 举证格式：`文件+行+复现`（evidence 写实测/代码行，suggestion 写最小修法）。
 - 同一任务第 2 次 `request-changes` 自动 HALT（`reviewRounds>=2`），此时列全 findings 让人一次看清。

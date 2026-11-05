@@ -52,7 +52,7 @@
 swarm_read_queue 看现状 → 分类意图 → plan → /swarm-start 派发 → dev会话或subagent → 轮询直到 drained 或 HALT → 验收通过主会话调 /swarm-clean 归档（人不敲命令）→ 汇报
 ```
 
-完整 recipe（含 prompt 模板、模型映射、五铁律）见 skill
+完整 recipe（含 prompt 模板、模型映射、六铁律）见 skill
 `.opencode/skills/swarm-orchestrate/SKILL.md`；
 执行器细节与判活 fence 见 §9（附录，编排循环 recipe 原文仍在那里，
 与 `/swarm-mode` 输出逐字一致，改文案先改 `swarm.js` 的 `DRAINED_RECIPE`）；
@@ -208,6 +208,9 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 > 不派发），按提示补齐重跑。`swarm_config` 会带出 `stacks`/`missingModels`，一眼看清缺啥。
 > 空轮报"队列已空"时若有同名显示名的非空轮，start 会直接指路（用 `--run <runId>` 重跑）。
 > high-risk 多单批量放行：`swarm_approve` 支持 `task_ids` 数组（原子语义：先验后写）。
+> 冻结线：PRD 全绿后 `/swarm-freeze --run <id> --reason <一句话>` 锁死入队（`swarm_plan` 拒收新任务，
+> hotfix:true 单任务例外）；收尾轮只收 Nit、不开新任务，out-of-scope 只登记；解冻 `/swarm-unfreeze --run <id>`。
+> 三笔账规避：acceptance 必须枚举对称路径（读写删/通过驳回），reviewer 先 grep 全仓再判复用，dev 先找后写。
 
 输出：`已派发 W1-T1（wave=W1）→ dev` + `已唤醒 ses_xxx（dev）→ 该会话开始执行 W1-T1`。
 队列里 `W1-T1` 变 `dev_doing`，通道里出现 `[TASK-ASSIGN] task=W1-T1 ... to=dev`，

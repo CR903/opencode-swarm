@@ -102,9 +102,9 @@ before(async () => {
 after(() => { rmSync(dir, { recursive: true, force: true }); });
 
 describe('插件注册面', () => {
-  test('17 个命令 + 11 个工具全部注册（N1 新增 swarm_review；drained 新增只读 swarm-drained；clean 新增归档 swarm-clean；orchestrate 新增 swarm_halt/swarm_revert/swarm_config；eval 新增只读 swarm-eval；approve 新增 swarm_approve；npm 包新增 swarm-init）', () => {
+  test('19 个命令 + 11 个工具全部注册（N1 新增 swarm_review；drained 新增只读 swarm-drained；clean 新增归档 swarm-clean；orchestrate 新增 swarm_halt/swarm_revert/swarm_config；eval 新增只读 swarm-eval；approve 新增 swarm_approve；npm 包新增 swarm-init；冻结线新增 swarm-freeze/swarm-unfreeze）', () => {
     assert.deepEqual([...cmds.keys()].sort(),
-      ['swarm-clean', 'swarm-drained', 'swarm-eval', 'swarm-halt', 'swarm-init', 'swarm-migrate', 'swarm-mode', 'swarm-models', 'swarm-nightly', 'swarm-rebuild', 'swarm-retry', 'swarm-revert', 'swarm-runs', 'swarm-start', 'swarm-status', 'swarm-switch', 'swarm-up']);
+      ['swarm-clean', 'swarm-drained', 'swarm-eval', 'swarm-freeze', 'swarm-halt', 'swarm-init', 'swarm-migrate', 'swarm-mode', 'swarm-models', 'swarm-nightly', 'swarm-rebuild', 'swarm-retry', 'swarm-revert', 'swarm-runs', 'swarm-start', 'swarm-status', 'swarm-switch', 'swarm-unfreeze', 'swarm-up']);
     assert.deepEqual([...tools.keys()].sort(),
       ['swarm_approve', 'swarm_claim', 'swarm_config', 'swarm_done', 'swarm_halt', 'swarm_next', 'swarm_plan', 'swarm_read_queue', 'swarm_revert', 'swarm_review', 'swarm_test']);
   });
@@ -4200,3 +4200,48 @@ describe('按需模型门禁（start 硬拦：只索要实际 stack，不靠主�
   });
 });
 
+
+describe('冻结线：/swarm-freeze 锁死入队，hotfix 例外（w6 无终点复盘）', () => {
+  test('freeze/unfreeze 基本：meta 落盘 + timeline 留痕 + 幂等', async () => {
+    const f1 = await cmd('swarm-freeze', '--run FRZ1 --reason PRD全绿收尾');
+    assert.match(f1, /已冻结/);
+    assert.match(f1, /FRZ1/);
+    const meta = JSON.parse(readFileSync(join(dir, '.swarm/runs/FRZ1/meta.json'), 'utf8'));
+    assert.equal(meta.frozen, true);
+    assert.equal(meta.frozenReason, 'PRD全绿收尾');
+    const f2 = await cmd('swarm-freeze', '--run FRZ1');
+    assert.match(f2, /已处于冻结/);
+    const u1 = await cmd('swarm-unfreeze', '--run FRZ1');
+    assert.match(u1, /已解冻/);
+    const meta2 = JSON.parse(readFileSync(join(dir, '.swarm/runs/FRZ1/meta.json'), 'utf8'));
+    assert.equal(meta2.frozen ?? false, false);
+    const u2 = await cmd('swarm-unfreeze', '--run FRZ1');
+    assert.match(u2, /未冻结/);
+  });
+
+  test('冻结轮 plan 整批拒收（零写行），hotfix:true 放行并标注', async () => {
+    await cmd('swarm-freeze', '--run FRZ2 --reason 收尾只收Nit');
+    const out = await run('swarm_plan', {
+      run: 'FRZ2',
+      tasks: [
+        { id: 'FZ-T1', wave: 'W9', stack: 'backend', title: '新功能', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false },
+        { id: 'FZ-HOT', wave: 'W9', stack: 'backend', title: '线上越权hotfix', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false, hotfix: true },
+      ],
+    });
+    assert.match(out, /FZ-T1: frozen（本轮已冻结，拒收）/);
+    assert.match(out, /FZ-HOT: queued \(HOTFIX\)/);
+    assert.match(out, /解冻.*swarm-unfreeze/);
+    const qs = queueState();
+    assert.equal(qs.find((t) => t.id === 'FZ-T1'), undefined, '冻结拒收：共享队列无此行');
+    assert.ok(qs.find((t) => t.id === 'FZ-HOT'), 'hotfix 照常入队');
+    const tl = readFileSync(join(dir, '.swarm/runs/FRZ2/timeline.jsonl'), 'utf8');
+    assert.doesNotMatch(tl, /"taskId":"FZ-T1"/, '拒收任务零写行（含 timeline 无 create）');
+    // 解冻后恢复
+    await cmd('swarm-unfreeze', '--run FRZ2');
+    const back = await run('swarm_plan', {
+      run: 'FRZ2',
+      tasks: [{ id: 'FZ-T1', wave: 'W1', stack: 'backend', title: '新功能', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false }],
+    });
+    assert.match(back, /FZ-T1: queued/);
+  });
+});

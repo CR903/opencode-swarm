@@ -22,7 +22,7 @@ permission:
    - `id`：`<wave>-T<n>`，全局唯一
    - `wave`：分组
    - `title`：一句话
-   - `acceptance`：**怎样算通过**，可被第三方独立判断
+   - `acceptance`：**怎样算通过**，可被第三方独立判断；**必须枚举对称路径**（只修一半规避：读写删三端、通过/驳回两分支、新增/存量两入口——有一个算一个，写不全的打回重拆）
    - `verify_cmd`：可直接执行的命令，exit 0 = 过
    - `stack`：三选一必填（`backend` 后端 / `frontend` 前端 / `integration` 联调；缺它入队被拒）。全栈需求按这三类拆，不许一个任务横跨两端。
    - `testing`：测什么（可写"同 verify_cmd"）
