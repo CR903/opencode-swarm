@@ -483,7 +483,7 @@ findings: [{id, severity: Important|Nit|Pre-existing, file, line, rule, evidence
 `swarm_test pass:false` 必须带 `disposition`（`fixed / wrong / intentional / wontfix`），缺失或非法直接拒收（状态不动）。它与 `failed_ids/detail` 同存队列+timeline（`detail` 存全量，事件截 500，`--task` 可见，rebuild 还原）。连续失败达 `maxRetries`（默认 3）即 HALT：输出含"建议重审方案而非继续修" + 最近三轮 `detail` 摘要（timeline `patch.detail` 取，500 截断；无则 `(无记录)`，不崩）。HALT 后用 `/swarm-revert --task X` 回门禁前重做，或 `/swarm-retry` 归零重派。
 
 **Q：高风险任务谁来放行？**
-`status` 待批行点名的任务（risk=high 且无 approve），在主会话说一句"我看了 W1-T1，可以放行"——编排 skill 会调 `swarm_approve` 写 `kind='approve'` 审计行（by+sessionID 留痕，幂等，重复批不写行），派发自动解锁，任务状态不动。`swarm_claim` 不查批（软卡可绕过，靠审计威慑），所以派 subagent 前先看待批行，无批不派（§9 recipe 同款要求）。
+`status` 待批行点名的任务（risk=high 且无 approve），在主会话说一句"我看了 W1-T1，可以放行"——编排 skill 会调 `swarm_approve` 写 `kind='approve'` 审计行（by+sessionID 留痕，幂等，重复批不写行），派发自动解锁，任务状态不动。`swarm_claim` 查批（high-risk 无 approve 直接拒收，`force:true` 可绕过但审计可见），派 subagent 前同样先看待批行，无批不派（§9 recipe 同款要求）。
 
 **Q：`/swarm-nightly` 会改状态吗？**
 不会，只读。顺序重跑该 run 全部 `passed` 任务的 `verify_cmd`（复用 `runVerify`，超时走配置），跑红也不改 `passed`，不调任何 `transition`。不建任务、不 at 人；cron 下一轮再议。只发一条汇总事件 `[NIGHTLY-GREEN]`（全绿）或 `[NIGHTLY-RED]`（有红，含失败 id），FileBus+timeline 双写，`status` 尾可见即算可见。长队列用 `--limit N`（默认 20，超出列清单不跑）。

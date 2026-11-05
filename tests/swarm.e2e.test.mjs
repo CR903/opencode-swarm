@@ -880,6 +880,7 @@ describe('risk 分级与 status 标出', () => {
     await run('swarm_plan', {
       tasks: [{ id: 'W-RISK', wave: 'W9', stack: 'backend', title: '高风险改动', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', paths: ['src/core/pay.ts'] , review: false}],
     });
+    await run('swarm_approve', { task_id: 'W-RISK', as: 'risk-tester' });
     await run('swarm_claim', { task_id: 'W-RISK' });
     const done = await run('swarm_done', { task_id: 'W-RISK', summary: '高风险改完' });
     assert.match(done, /门禁通过/);
@@ -1527,6 +1528,7 @@ describe('Reviewer-N1 全闭环（review=true）', () => {
     await run('swarm_plan', {
       tasks: [{ id: 'REV-D3', wave: 'W9', stack: 'backend', title: '显式关闭', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', review: false }],
     });
+    await run('swarm_approve', { task_id: 'REV-D3' });
     await run('swarm_claim', { task_id: 'REV-D3' });
     await run('swarm_done', { task_id: 'REV-D3', summary: '显式关评' });
     const out = await run('swarm_test', { task_id: 'REV-D3', pass: true });
@@ -2541,13 +2543,38 @@ describe('无参 /swarm-up 提问式开场卡（零会话零落盘零队列读�
     assert.equal(after.name, '新需求名D', '改名生效');
   });
 
-  test('high-risk 未批直抢：claim 放行但带软提示（指去补批），不静默', async () => {
+  test('high-risk 未批直抢：claim 硬拦（状态不动）→ 批后放行 → force 逃生', async () => {
     const tRun = async (name, input) => (await toolsUMap.get(name).execute(withForce(name, input))).content;
-    const p = await tRun('swarm_plan', { tasks: [{ id: 'NC-T1', wave: 'NC', stack: 'backend', title: '高风险直抢', acceptance: '人工复核通过', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', paths: ['src/pay.ts'] }], run: 'NAMECLAIM' });
+    const p = await tRun('swarm_plan', { tasks: [
+      { id: 'NC-T1', wave: 'NC', stack: 'backend', title: '高风险直抢', acceptance: '人工复核通过', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', paths: ['src/pay.ts'] },
+      { id: 'NC-T2', wave: 'NC', stack: 'backend', title: '高风险逃生', acceptance: '人工复核通过', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', paths: ['src/pay.ts'] },
+    ], run: 'NAMECLAIM' });
     assert.match(p, /NC-T1: queued/);
-    const c = await tRun('swarm_claim', { task_id: 'NC-T1', run: 'NAMECLAIM' });
-    assert.match(c, /已认领 NC-T1/);
-    assert.match(c, /swarm_approve|高风险未批|补批/);
+    const raw = async (input) => (await toolsUMap.get('swarm_claim').execute(input)).content;
+    const c = await raw({ task_id: 'NC-T1', run: 'NAMECLAIM' });
+    assert.match(c, /高风险未批/);
+    assert.match(c, /不许认领/);
+    assert.match(c, /swarm_approve/);
+    const st = await tRun('swarm_read_queue', { run: 'NAMECLAIM' });
+    assert.match(st, /NC-T1/);
+    // force 逃生：显式声明即放行，但回执注审计可见
+    const f = await tRun('swarm_claim', { task_id: 'NC-T2', run: 'NAMECLAIM', force: true });
+    assert.match(f, /已认领 NC-T2/);
+    assert.match(f, /force:true 绕过/);
+    // 批后放行
+    const ap = await tRun('swarm_approve', { task_id: 'NC-T1', run: 'NAMECLAIM', as: 'gate-tester' });
+    assert.match(ap, /已批准 NC-T1/);
+    const c2 = await tRun('swarm_claim', { task_id: 'NC-T1', run: 'NAMECLAIM' });
+    assert.match(c2, /已认领 NC-T1/);
+  });
+
+  test('approve 缺 as 不冒认 human：记 unknown-session', async () => {
+    const tRun = async (name, input) => (await toolsUMap.get(name).execute(withForce(name, input))).content;
+    await tRun('swarm_plan', { tasks: [{ id: 'NC-A1', wave: 'NC', stack: 'backend', title: '匿名批', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high' }], run: 'NAMECLAIM' });
+    const ap = await tRun('swarm_approve', { task_id: 'NC-A1', run: 'NAMECLAIM' });
+    assert.match(ap, /已批准 NC-A1/);
+    assert.match(ap, /unknown-session:/);
+    assert.doesNotMatch(ap, /by=human/);
   });
 
   test('裸 --dry-run 保持 dry-run 语义（不触发开场卡）', async () => {

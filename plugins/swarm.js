@@ -2321,7 +2321,7 @@ export default {
 
       editor.add({
         name: 'swarm_claim',
-        description: 'dev 认领任务（queued → dev_doing，CAS 保证不双花；本轮未 /swarm-start 时拒收）',
+        description: 'dev 认领任务（queued → dev_doing，CAS 保证不双花；本轮未 /swarm-start 时拒收；high-risk 无 approve 拒收，force:true 逃生）',
         input: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, force: { type: 'boolean' }, ...S }, required: ['task_id'], additionalProperties: false },
         execute: async (input, toolCtx) => {
           // 任务归属优先：子代理就算没带 run、会话也没登记，也能按 task_id 落到正确轮。
@@ -2332,6 +2332,20 @@ export default {
           if (isPendingStart(runId) && input.force !== true) {
             return { content: `⛔ ${START_GATE_HINT}\nrun=${runId}，任务 ${input.task_id} 仍在 queued（确认要绕过加 force:true）` };
           }
+          // 高风险硬拦（与 dispatch 同口径；w5-T3 零审批直通事故）：high-risk 且同 run timeline
+          // 无 kind='approve' 行 → 拒收，状态不动。逃生口 force:true（绕过需显式声明）。
+          // 已 dev_doing 的「可继续」路径不经过这里（状态未变），不受影响。
+          try {
+            const qpPre = input?.queue ? abs(cwd, input.queue) : queueFor(runId);
+            const pre = loadQueue(qpPre).find((t) => t && t.id === input.task_id);
+            if (pre && pre.status === 'queued' && highRiskTasks([pre], cfg.sensitivePaths).length && input.force !== true) {
+              const rrPre = resolveRun(cwd, { run: runId, queue: effQueue(), cfgRunId: rawRunId });
+              const approved = readTimeline(rrPre.runDir).some((row) => row && row.taskId === pre.id && row.kind === 'approve');
+              if (!approved) {
+                return { content: `⛔ 高风险未批：${pre.id}（risk=${pre.risk ?? 'high'}）不许认领（run=${runId}，状态仍在 queued）。主会话确认 diff 后补批：调工具 swarm_approve {task_id: "${pre.id}"}（多单批量用 {task_ids: [...]}）。批后自动解锁（确认要绕过加 force:true）` };
+              }
+            }
+          } catch { /* 预检失败走老路（transition 照常），不误拦 */ }
           const r = await transition(runId, input.task_id, 'queued', {
             status: 'dev_doing', assignee: who,
           }, { by: input.as ?? who, reason: 'claim', queue: input?.queue ?? null });
@@ -2349,16 +2363,17 @@ export default {
             return { content: `认领失败：${r.message}` };
           }
           await emitFor(runId, who, '[TASK-ASSIGN]', { task: r.task.id, wave: r.task.wave, to: who, verify: r.task.verify_cmd });
-          // 高风险软提示（10-31-swarm-up-name-card）：放行但不静默 —— high-risk 且同 run timeline
-          // 无 kind='approve' 行时，回执追加补批指引（含 swarm_approve 用法 + 任务 id）；有 approve/非 high 零变。
-          // 只加提示，不断言改拒（claim 照常放行，状态已流转 dev_doing）。
+          // 高风险提示：有 approve 零变；force:true 绕过时注审计可见；兜底保留无批提示
+          // （硬拦在前，正常走不到无批成功路径）。
           let claimTip = '';
           try {
             if (highRiskTasks([r.task], cfg.sensitivePaths).length) {
               const rrClaim = resolveRun(cwd, { run: runId, queue: effQueue(), cfgRunId: rawRunId });
               const approved = readTimeline(rrClaim.runDir).some((row) => row && row.taskId === r.task.id && row.kind === 'approve');
               if (!approved) {
-                claimTip = `\n⚠️ 高风险未批：${r.task.id} 尚未补批（已放行认领，不阻断）。主会话确认 diff 后补批：调工具 swarm_approve {task_id: "${r.task.id}"}`;
+                claimTip = input.force === true
+                  ? `\n⚠️ 高风险未批：${r.task.id} 系 force:true 绕过审批门认领（审计可见，请尽快补批：swarm_approve {task_id: "${r.task.id}"}）`
+                  : `\n⚠️ 高风险未批：${r.task.id} 尚未补批。主会话确认 diff 后补批：调工具 swarm_approve {task_id: "${r.task.id}"}`;
               }
             }
           } catch { claimTip = ''; }
@@ -2778,8 +2793,9 @@ export default {
               const last = rows[rows.length - 1];
               return { content: `run=${runId} · ✅ 已批：${id} 已有批准记录（by=${last.by ?? '-'}，seq=${last.seq ?? '?'}），不重复写行` };
             }
-            const by = input?.as ?? 'human';
-            const sid = (toolCtx && (toolCtx.sessionID ?? toolCtx.sessionId)) ?? input?.sessionID ?? by;
+            // by 必须显式：缺 as 不再默认 human（冒认）——记 unknown-session:<sid>，审计可辨。
+            const sid = (toolCtx && (toolCtx.sessionID ?? toolCtx.sessionId)) ?? input?.sessionID ?? 'unknown';
+            const by = (typeof input?.as === 'string' && input.as.trim()) ? input.as.trim() : `unknown-session:${String(sid)}`;
             const risk = task.risk ?? 'high';
             appendTimeline(tlPath, {
               taskId: id, kind: 'approve', from: null, to: null,
@@ -2812,8 +2828,8 @@ export default {
           } catch {
             rows = [];
           }
-          const by = input?.as ?? 'human';
-          const sid = (toolCtx && (toolCtx.sessionID ?? toolCtx.sessionId)) ?? input?.sessionID ?? by;
+          const sid = (toolCtx && (toolCtx.sessionID ?? toolCtx.sessionId)) ?? input?.sessionID ?? 'unknown';
+          const by = (typeof input?.as === 'string' && input.as.trim()) ? input.as.trim() : `unknown-session:${String(sid)}`;
           const lines = [];
           for (const id of targets) {
             const task = queued.find((t) => t && t.id === id);

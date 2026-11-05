@@ -56,7 +56,7 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 - test 子代理 prompt = 任务 JSON + `verify_cmd` + 边界要求。
 - reviewer（review=true 任务 test pass 后）prompt = 任务 JSON + `git show <commit>` diff（截断 50KB）+ REVIEW.md 命中 + `excluded=[finding ids]`。
 - 判活口径与 `/swarm-drained` 同调：queued 空 + 无 `dev_doing/test_doing/reviewing` 即结束。
-- high-risk 任务派 subagent 前先查 approve 行（`swarm_read_queue` 看 timeline 或 status 待批行），无批不派（`swarm_claim` 语义不动，仍可绕过，靠审计威慑）。
+- high-risk 任务派 subagent 前先查 approve 行（`swarm_read_queue` 看 timeline 或 status 待批行），无批不派（`swarm_claim` 无批拒收，`force:true` 可绕过但审计可见）。
 - 确认门见 §1.5（两道门：开轮问 planner，入队问 start；原来“≤3 直接派”作废）。
 
 ## 4. 模型映射（start 时人工按需分配，门禁硬拦）
