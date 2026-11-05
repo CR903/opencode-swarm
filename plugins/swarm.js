@@ -30,6 +30,7 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadQueue, invalidate, transitionTask, enqueueTask, saveQueueAtomic, appendTimeline, requiredModels, TASK_STACKS } from '../lib/swarm-store.js';
+import { sessionRunIndex as boardSessionIndex } from '../lib/swarm-board-data.mjs'; // 看板同源（status 自报必须与 TUI 一致）
 import { createFileBus, eventId } from '../lib/swarm-filebus.js';
 import { checkGate, headCommit, matchPatterns, baseHead } from '../lib/swarm-gate.js';
 import { parseTag, expandTag, ROLES, hasRole } from '../lib/swarm-roles.js';
@@ -1746,6 +1747,19 @@ export default {
             dispLine = `disposition 分布：fixed=${dd.fixed} wrong=${dd.wrong} intentional=${dd.intentional} wontfix=${dd.wontfix}`;
           } catch { /* 指标失败不影响主状态 */ }
 
+          // 本会话跟随身份（看板/sidebar 按它显隐 + 高亮）：调过动作命令才登记，
+          // 重启服务后 sid 会变，未跑过命令前保持未登记（隐藏）。只读命令不登记。
+          let selfLine = '';
+          try {
+            const sid = typeof sessionID === 'string' ? sessionID.trim() : '';
+            if (sid) {
+              const hit = boardSessionIndex(cwd)[sid];
+              selfLine = (hit && typeof hit.runId === 'string' && hit.runId)
+                ? `### 本会话\n- 当前会话 \`${sid}\`：已登记在 run **${hit.runId}**（role=${hit.role}）—— 看板跟随该轮并高亮。\n\n`
+                : `### 本会话\n- 当前会话 \`${sid}\`：未在任何轮登记 —— 看板/sidebar 对本会话隐藏。登记发生在 plan/claim/done/test/review/approve/start 等动作命令（只读命令不登记）；重启服务后 sid 会变化，未跑过命令前保持隐藏。\n\n`;
+            }
+          } catch { selfLine = ''; }
+
           // 会话台账：这是「任务到底有没有派下去、那边是不是真的在跑」的唯一可见入口。
           // 模型在这里再核一次 —— swarm-up 之后有人手改过模型 / 模型下架，都能当场发现。
           const r = readRoundFor(runId);
@@ -1789,6 +1803,7 @@ export default {
             sessionID,
             text: `## swarm-status\nRun：${runId}　队列：${displayPath(cwd, qp)}　通道：${cfg.channel}　轮次：${r.name ? `**${r.name}**` : '(未命名)'}\n${execLineFor(runId)}\n\n` +
               `### 会话\n${sessionBlock}\n\n` +
+              selfLine +
               `### 队列\n${table(tasks)}\n\n` +
               `### 质量\n- ${roundsLine}\n- ${dispLine}\n\n` +
               (risky.length ? `### 高风险提示\n⚠️ 高风险：建议两人复核：${risky.map((t) => t.id).join(', ')}\n\n` : '') +

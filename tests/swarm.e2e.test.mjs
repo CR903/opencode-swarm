@@ -4052,7 +4052,7 @@ describe('按需模型门禁（start 硬拦：只索要实际 stack，不靠主�
       tool: { transform: async (fn) => fn({ add: (d) => toolsG.set(d.name, d) }) },
     };
     await plugin.setup(ctxG);
-    runG = async (name, input) => (await toolsG.get(name).execute(input)).content;
+    runG = async (name, input, toolCtx) => (await toolsG.get(name).execute(input, toolCtx)).content;
     cmdG = async (name, text = '', sessionID = 's1') => {
       await cmdsG.get(name).execute({ sessionID, prompt: { text } });
       return promptsG.at(-1);
@@ -4182,10 +4182,21 @@ describe('按需模型门禁（start 硬拦：只索要实际 stack，不靠主�
       tasks: [{ id: 'GV-T1', wave: 'W1', stack: 'backend', title: '可视化', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false }],
     });
     assert.match(p, /GV-T1: queued/);
-    const c = await runG('swarm_claim', { run: 'GATEVIS', task_id: 'GV-T1', role: 'dev' });
+    const c = await runG('swarm_claim', { run: 'GATEVIS', task_id: 'GV-T1', role: 'dev' }, { sessionID: 's1-vis' });
     assert.match(c, /run=GATEVIS · 已认领 GV-T1/);
     const d = await runG('swarm_done', { run: 'GATEVIS', task_id: 'GV-T1', summary: '做完' });
     assert.match(d, /run=GATEVIS · ✅ 门禁通过/);
+  });
+
+  test('status 自报跟随身份：已登记给 run，未登记明说隐藏', async () => {
+    // 独立 sid（s1-vis）：同套件其它用例的 swarm-up 会 unbind s1，用独立 sid 隔离串扰；
+    // 排在 #4 claim 之后（s1-vis 已登记进 GATEVIS）
+    const reg = await cmdG('swarm-status', '--run GATEVIS', 's1-vis');
+    assert.match(reg, /### 本会话/);
+    assert.match(reg, /已登记在 run \*\*GATEVIS\*\*/);
+    const ghost = await cmdG('swarm-status', '--run GATEVIS', 'ghost-sess-xyz');
+    assert.match(ghost, /未在任何轮登记/);
+    assert.match(ghost, /隐藏/);
   });
 });
 

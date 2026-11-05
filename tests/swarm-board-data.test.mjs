@@ -507,3 +507,22 @@ describe('shouldShowBoard：别轮隐藏（sidebar 整卡 + footer 共用判据�
     assert.equal(shouldShowBoard('ses_x', undefined), true);
   });
 });
+
+describe('sessionRunIndex 健壮性（看板跟随数据源）', () => {
+  test('缺 sessions 键不断整轮：members 照进索引', () => {
+    putRun('nosess', {
+      'round.json': JSON.stringify({ name: 'N', members: { ses_nosess_host: { role: 'host', at: '2026-11-05T00:00:00.000Z' } } }),
+    });
+    const idx = sessionRunIndex(dir);
+    assert.deepEqual(idx['ses_nosess_host'], { runId: 'nosess', role: 'host' });
+  });
+
+  test('members 数组脏数据：不崩且视作空', () => {
+    putRun('arrmem', {
+      'round.json': JSON.stringify({ name: 'A', sessions: {}, members: [] }),
+    });
+    let idx;
+    assert.doesNotThrow(() => { idx = sessionRunIndex(dir); });
+    assert.ok(idx['ses_nosess_host'], '已有索引不受脏轮影响');
+  });
+});
