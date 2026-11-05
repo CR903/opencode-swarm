@@ -27,7 +27,7 @@ import { parseCommand, runVerify, DEFAULT_ALLOWLIST } from '../lib/swarm-exec.js
 import { eventId, createChannel } from '../lib/swarm-events.js';
 import { createFileBus, eventId as busEventId } from '../lib/swarm-filebus.js';
 import { checkGate, registerGate, GATES, FORBIDDEN, matchPatterns } from '../lib/swarm-gate.js';
-import { parseTag, expandTag, ROLES, TAG_INDEX, registerRole, hasRole, rebuildTagIndex } from '../lib/swarm-roles.js';
+import { parseTag, expandTag, expandTagCompact, renderTaskBlock, ROLES, TAG_INDEX, registerRole, hasRole, rebuildTagIndex } from '../lib/swarm-roles.js';
 import { writeRound, readRound } from '../lib/swarm-sessions.js';
 
 let dir;
@@ -343,6 +343,29 @@ describe('roles & tags', () => {
   test('任务找不到时给出指引而不是瞎猜', () => {
     const text = expandTag({ role: 'test', taskId: 'NOPE-9', rest: '' }, undefined);
     assert.match(text, /未在队列中找到/);
+  });
+
+  test('增量唤醒：任务块与全量逐字一致、契约压成一行、更短', () => {
+    const task = { id: 'W1-T1', wave: 'W1', status: 'dev_doing', title: '改 n', acceptance: 'exit 0', verify_cmd: 'node verify.mjs', retries: 2, risk: 'high', paths: ['a/b.go'] };
+    const full = expandTag({ role: 'dev', taskId: 'W1-T1', rest: '' }, task);
+    const inc = expandTagCompact({ role: 'dev', taskId: 'W1-T1', rest: '' }, task);
+    assert.match(inc, /你是 dev/);
+    assert.match(inc, /W1-T1/);
+    assert.match(inc, /改 n/);
+    assert.match(inc, /node verify\.mjs/);
+    assert.match(inc, /已失败 2 次/);
+    assert.match(inc, /高风险/);
+    assert.match(inc, /a\/b\.go/);
+    assert.doesNotMatch(inc, /只做被指派的那一个任务/, '增量体不得含完整契约长句');
+    assert.ok(inc.length < full.length, `增量体应更短（全量${full.length} vs 增量${inc.length}）`);
+    // 任务块同源：全量去掉契约行后应与增量任务块一致
+    const taskBlock = renderTaskBlock(task).filter(Boolean).join('\n');
+    assert.ok(full.includes(taskBlock), '全量体含标准任务块');
+    assert.ok(inc.includes(taskBlock), '增量体含同一任务块（逐字一致）');
+  });
+
+  test('增量唤醒：未知角色回 null，与全量同口径', () => {
+    assert.equal(expandTagCompact({ role: 'nope', taskId: 'X-1', rest: '' }, undefined), null);
   });
 });
 

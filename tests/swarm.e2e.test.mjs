@@ -3779,6 +3779,102 @@ describe('空轮不继承旧会话（W3-T1：空轮零继承 + 禁跨轮唤醒�
   });
 });
 
+describe('唤醒去重（1.6.0 token-economy：首条全量 + 同会话增量）', () => {
+  // 质量不降的省 token：完整契约只发一次（首条唤醒历史 + 会话 instructions 各一份），
+  // 后续唤醒任务块逐字一致、契约压成一行；sid 变化（会话重建）自动回全量。
+  const makeWorld = async () => {
+    const d = mkdtempSync(join(tmpdir(), 'swarm-wakededup-'));
+    writeFileSync(join(d, 'ok.mjs'), 'process.exit(0);\n');
+    const prompts = [];
+    const promptCalls = [];
+    const sessions = new Map();
+    const toolsM = new Map();
+    const cmdsM = new Map();
+    let seq = 0;
+    const ctxM = {
+      location: { directory: d },
+      options: { channel: 'swarm-wakededup-e2e', maxRetries: 3, verifyTimeoutMs: 20_000 },
+      model: { list: async () => [{ providerID: 'opencode-go', id: 'm-ok', name: 'OK' }] },
+      session: {
+        prompt: async ({ sessionID, text }) => { promptCalls.push({ sessionID, text }); prompts.push(`[${sessionID}] ${text}`); },
+        create: async ({ title }) => { const id = `w-${++seq}`; sessions.set(id, { id, title }); return { id, title }; },
+        get: async ({ sessionID }) => sessions.get(sessionID),
+        update: async ({ sessionID, title }) => {
+          const s = sessions.get(sessionID) ?? { id: sessionID };
+          s.title = title;
+          sessions.set(sessionID, s);
+        },
+        switchModel: async () => {},
+        hook: async () => {},
+      },
+      command: { transform: async (fn) => fn({ add: (x) => cmdsM.set(x.name, x) }) },
+      tool: { transform: async (fn) => fn({ add: (x) => toolsM.set(x.name, x) }) },
+    };
+    await plugin.setup(ctxM);
+    return {
+      d, prompts, promptCalls, sessions,
+      run: async (name, input) => (await toolsM.get(name).execute(withForce(name, input))).content,
+      cmd: async (name, text = '', sessionID = 'caller') => {
+        await cmdsM.get(name).execute({ sessionID, prompt: { text } });
+        return prompts.at(-1);
+      },
+    };
+  };
+  const roundOf = (w, run) => JSON.parse(readFileSync(join(w.d, '.swarm/runs', run, 'round.json'), 'utf8'));
+
+  test('同会话第 2 次唤醒走增量：更短、任务全、有 dev 标记、无完整契约', async () => {
+    const w = await makeWorld();
+    try {
+      await w.run('swarm_plan', {
+        run: 'WAKEC',
+        tasks: [
+          { id: 'WC-T1', wave: 'W1', stack: 'backend', title: '首单', acceptance: 'exit 0', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false },
+          { id: 'WC-T2', wave: 'W1', stack: 'backend', title: '次单', acceptance: 'exit 0', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false },
+          { id: 'WC-T3', wave: 'W1', stack: 'backend', title: '三单', acceptance: 'exit 0', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false },
+        ],
+      });
+      const flags = '--run WAKEC --executor sessions --dev-backend-model opencode-go/m-ok --tester-model opencode-go/m-ok';
+      const s1 = await w.cmd('swarm-start', flags);
+      assert.match(s1, /已派发 WC-T1/);
+      const devSid = roundOf(w, 'WAKEC').sessions.dev;
+      assert.ok(devSid, 'dev 会话应登记');
+      const wake1 = w.promptCalls.filter((c) => c.sessionID === devSid).map((c) => c.text).join('\n');
+      assert.match(wake1, /你是 dev/);
+      assert.match(wake1, /WC-T1/);
+      assert.match(wake1, /只做被指派的那一个任务/, '首条唤醒发全量契约');
+      assert.equal(roundOf(w, 'WAKEC').woken?.dev, devSid, '首条唤醒成功后 woken 落盘');
+
+      // 清场 WC-T1（halt 不触发管线自动派发），再 start 派 WC-T2 → 同会话增量唤醒
+      await w.run('swarm_halt', { run: 'WAKEC', task_id: 'WC-T1', reason: '让位' });
+      const before = w.promptCalls.length;
+      const s2 = await w.cmd('swarm-start', flags);
+      assert.match(s2, /已派发 WC-T2/);
+      const wake2Calls = w.promptCalls.slice(before).filter((c) => c.sessionID === devSid);
+      assert.equal(wake2Calls.length, 1, '只向同一 dev 会话投递一次');
+      const wake2 = wake2Calls[0].text;
+      assert.match(wake2, /你是 dev/);
+      assert.match(wake2, /WC-T2/);
+      assert.match(wake2, /次单/);
+      assert.match(wake2, /node ok\.mjs/);
+      assert.doesNotMatch(wake2, /只做被指派的那一个任务/, '增量体不得重发完整契约');
+      assert.ok(wake2.length < wake1.length, `增量体应更短（首条${wake1.length} vs 增量${wake2.length}）`);
+
+      // 会话重建（sid 变化）自动回全量：改台账 sid，清场后重派
+      await w.run('swarm_halt', { run: 'WAKEC', task_id: 'WC-T2', reason: '让位' });
+      const r = roundOf(w, 'WAKEC');
+      writeFileSync(join(w.d, '.swarm/runs/WAKEC/round.json'), `${JSON.stringify({ ...r, sessions: { dev: 'w-fake-new' } }, null, 2)}\n`);
+      const before3 = w.promptCalls.length;
+      const s3 = await w.cmd('swarm-start', flags);
+      assert.match(s3, /已派发 WC-T3/);
+      const wake3Calls = w.promptCalls.slice(before3).filter((c) => c.sessionID === 'w-fake-new');
+      assert.equal(wake3Calls.length, 1, '新 sid 应收到唤醒');
+      assert.match(wake3Calls[0].text, /只做被指派的那一个任务/, 'sid 变化自动回全量契约');
+    } finally {
+      rmSync(w.d, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('npm 包自带技能与 init（skills 随插件注册 + swarm-init 落盘）', () => {
   let dirN;
   let cmdsN;

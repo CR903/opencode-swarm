@@ -33,7 +33,7 @@ import { loadQueue, invalidate, transitionTask, enqueueTask, saveQueueAtomic, ap
 import { sessionRunIndex as boardSessionIndex } from '../lib/swarm-board-data.mjs'; // 看板同源（status 自报必须与 TUI 一致）
 import { createFileBus, eventId } from '../lib/swarm-filebus.js';
 import { checkGate, headCommit, matchPatterns, baseHead } from '../lib/swarm-gate.js';
-import { parseTag, expandTag, ROLES, hasRole } from '../lib/swarm-roles.js';
+import { parseTag, expandTag, expandTagCompact, ROLES, hasRole } from '../lib/swarm-roles.js';
 import { DEFAULT_ALLOWLIST, runVerify } from '../lib/swarm-exec.js';
 import {
   modelIndex, resolveModelRef, readRound, writeRound, deriveName, roleTitle,
@@ -732,13 +732,38 @@ export default {
         const m = info?.model;
         if (m && m.providerID && m.id) targetModel = { providerID: String(m.providerID), id: String(m.id) };
       } catch { targetModel = null; }
+      // 唤醒去重（1.6.0 token-economy）：同轮同会话首条发全量契约，后续只发增量
+      // （任务块逐字同全量 + 一行契约引用）。woken 记 sid：会话重建（sid 变化）
+      // 自动回全量。质量无损：完整契约在首条唤醒历史 + 会话 instructions 里各有一份。
+      // 读不到台账按非增量处理（老行为零变）；写回失败不挡投递（best-effort）。
+      let compact = false;
+      try {
+        const w = readRoundFor(runId).woken ?? {};
+        compact = !!sid && w[role] === sid;
+      } catch { compact = false; }
+      const markWoken = () => {
+        if (compact) return;
+        try {
+          const prev = readRoundFor(runId).woken ?? {};
+          writeRoundFor(runId, { woken: { ...prev, [role]: sid } });
+        } catch { /* 台账写失败不挡派发 */ }
+      };
+      const wakeText = (t) => {
+        if (!compact) return expandTag({ role, taskId: t.id, rest: '', raw: '' }, t);
+        try {
+          return expandTagCompact({ role, taskId: t.id, rest: '', raw: '' }, t) ?? expandTag({ role, taskId: t.id, rest: '', raw: '' }, t);
+        } catch {
+          return expandTag({ role, taskId: t.id, rest: '', raw: '' }, t);
+        }
+      };
       if (targetModel) {
         let index = null;
         try { index = await modelIndex(ctx); } catch { index = null; }
         if (!index) {
-          const text = expandTag({ role, taskId: task.id, rest: '', raw: '' }, task);
+          const text = wakeText(task);
           try {
             await ctx.session.prompt({ sessionID: sid, text });
+            markWoken();
             return { sessionID: sid, unverified: true };
           } catch (e) {
             return { error: `${sid}: ${oneLine(e?.message ?? e, 120)}` };
@@ -750,9 +775,10 @@ export default {
           return { blocked: `${role} 会话 ${sid} 模型不可用：${r.reason}${hint}；查可用模型：\`/swarm-models --search <关键词>\`（或 \`opencode api get /api/model\`），修模型后重建会话` };
         }
       }
-      const text = expandTag({ role, taskId: task.id, rest: '', raw: '' }, task);
+      const text = wakeText(task);
       try {
         await ctx.session.prompt({ sessionID: sid, text });
+        markWoken();
         return { sessionID: sid };
       } catch (e) {
         return { error: `${sid}: ${oneLine(e?.message ?? e, 120)}` };
@@ -1926,7 +1952,7 @@ export default {
               '```\n\n' +
               'dev 常驻会话直接开工（wake已投递；任务已是 dev_doing 且归自己时跳过 claim 直接开工，claim 返回"可继续"时同样直接开工）。test/reviewer 子代理流程不变。\n\n' +
               '### prompt 模板（派发 subagent 时拼；dev 常驻会话走 wake 注入体）\n' +
-              '- dev：`expandTag({role:"dev",taskId})` 全文 + `任务JSON` + 补充要求（必须含上次 fail 的 `detail/failed_ids`，时间线已现成，直接复用 wake 注入体）。\n' +
+              '- dev：`expandTag({role:"dev",taskId})` 全文 + `任务JSON` + 补充要求（必须含上次 fail 的 `detail/failed_ids`，时间线已现成，直接复用 wake 注入体；同轮同会话第 2+ 次唤醒走增量体：任务块逐字一致、契约压成一行，sid 变化自动回全量）。\n' +
               '- test：`expandTag({role:"test",taskId})` 全文 + `任务JSON`。\n' +
               '- reviewer：任务JSON + `git show <commit>` diff(截断50KB) + REVIEW.md命中 + excluded=[finding ids]（review 开的任务 test pass 后派：medium/high 默认进评审，low 显式开）。\n\n' +
               '### reviewer 两轮与去重（standard）\n' +

@@ -98,3 +98,15 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 异常升级：HALT 已有推送（requester 会收到"⛔ HALT 通知 … 恢复：/swarm-retry --task X"），
 收到即停轮询、原话转述给用户，等拍板；高风险任务（`risk=high` 或命中 `sensitivePaths`）
 把"⚠️ 高风险：建议两人复核"原文转述，不自己放行。
+
+## 6. token-economy（只指导编排侧的用词与读法，不碰任何门禁与流程）
+
+质量门禁（verify 重跑、test 独立判定、reviewer 语义复核、高风险 approve）一刀不砍；
+省 token 只从"少说废话、少读整文件、少贴全文"三处来：
+
+- **Targeted reading**：先 Grep/Glob 定位，再读目标段落；整文件读是最后手段。读队列/timeline 只取本轮当页（`swarm_read_queue`/`swarm-drained` 已是摘要口径，不要再全文 cat `queue.jsonl`）。
+- **Bound 输出**：要答案不要语料——`grep -c` 优先于 `grep` 全文，日志只取 `tail`，测试输出只回结论 + `verify_cmd` 退出码；全量内容落文件，给 pointer（verdict path / commit / timeline 行号），不贴进提示词。
+- **1KB hand-back**：派 subagent 时 prompt = 任务 JSON + 验收 + `verify_cmd` + 失败史（§3 已有）， subagent 回来只收一句话 summary + verdict，不收原始 log/file dump。`swarm_done` 的 summary 保持一句话。
+- **Delegation 阈值**：子代理/新会话有 ~10k 级固定地板价（新 context 从零起）。一次 grep/单文件小改主会话直做； noisy 的多文件扫描、并行探索才值得派。阈值是经验参考，不是门禁。
+- **前缀稳定**：唤醒增量机制由插件承担（首条全量、后续增量、换会话自动回全量），编排侧拼 prompt 时保持同一套措辞与顺序，利于缓存命中；不要每轮发明新话术。
+- **模型按需**：§4 默认映射（dev/test 走低强度、planner/reviewer 走高强度）已是成本最优点；质量由门禁兜底——低强度做错会被 verify/test 打回，换高强度只在"难啃单任务"上点对点加，不整轮升级。

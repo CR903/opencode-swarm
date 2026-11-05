@@ -34,6 +34,7 @@
 ```
 
 tag 由插件的 `session.prompt` hook 展开：角色契约 + 任务详情 + 你的补充要求（补充要求已内嵌为展开体 `## 补充要求` 节，不再复读原话全文）。
+自动唤醒（派发/交接时插件直调，无 tag hook）首条发全量、同轮同会话后续走增量体（任务块逐字一致、契约压成一行；换会话自动回全量；`round.json → woken` 记录首发 sid）。
 审计走 timeline/通道事件，不走 prompt token。非 tag 输入完全不改写。
 
 也可以直接把会话切成对应 agent（agent 文件已带完整 system prompt，Tab 切换即可）。
