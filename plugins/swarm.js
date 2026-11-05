@@ -983,6 +983,74 @@ export default {
       }
     }
 
+    /**
+     * start 自动补建 dev 常驻会话（11-05 空转复盘）：up 只建空轮、start 只派发，
+     * dev 执行者落在两者缝隙里 —— 每次都要人肉 up --force 补建。
+     * start 时 roleModels 已配齐（门禁保证），这里按 backend>legacy>frontend 取值序建一个，
+     * 建完 dispatch 的唤醒一次即达。subagents 执行器天然走子代理，跳过。
+     * 已有 dev 会话直接复用（不重建、不改模型）。永不抛错：失败只回 error 行，
+     * 调用方照常派发（wakeRole 会如实报跳过），不卡主流程。
+     */
+    async function ensureDevSession(runId, name) {
+      try {
+        if (isSubRole('dev', runId)) return { skipped: true, line: '' };
+        let sessions = {};
+        try { sessions = roleSessionsFor(runId) ?? {}; } catch { sessions = {}; }
+        if (sessions.dev) return { exists: true, line: '' };
+        let rms = {};
+        try { rms = (readMeta(cwd, runId) ?? {}).roleModels ?? {}; } catch { rms = {}; }
+        const pick = [rms.dev_backend, rms.dev, rms.dev_frontend].find((v) => typeof v === 'string' && v.trim()) ?? '';
+        let model = null;
+        const parsed = pick ? splitModel(pick) : null;
+        if (parsed) model = { providerID: parsed.providerID, id: parsed.id, ...(parsed.variant ? { variant: parsed.variant } : {}) };
+        const shown = pick || '默认模型';
+        let sid = null;
+        try {
+          const s = await ctx.session.create({
+            title: name ? (roleTitle(name, 'dev') ?? 'swarm-dev') : 'swarm-dev',
+            ...(ROLES.dev.agent ? { agent: ROLES.dev.agent } : {}),
+            ...(model ? { model } : {}),
+          });
+          sid = s?.id ?? s?.sessionID ?? null;
+        } catch (e) {
+          return { error: oneLine(e?.message ?? e, 120), line: `\n⚠️ dev 常驻会话补建失败（${oneLine(e?.message ?? e, 100)}）：派发照常，可手动重跑 start 重试` };
+        }
+        if (!sid) return { error: '返回值里没有 sessionID', line: '\n⚠️ dev 常驻会话补建失败（返回值里没有 sessionID）：派发照常，可手动重跑 start 重试' };
+        // 回读核对（与 up ③ 同口径，best-effort，不拦）。
+        let warn = '';
+        try {
+          const actual = await ctx.session.get({ sessionID: sid });
+          const got = actual?.model;
+          const ok = !model || (got?.providerID === model.providerID && got?.id === model.id && (!model.variant || got?.variant === model.variant));
+          if (!ok) warn = `\n  ⚠️ 实际模型是 ${got ? `${got.providerID}/${got.id}${got.variant ? `#${got.variant}` : ''}` : '(空)'}，与要求不一致`;
+        } catch { /* 读不到就按未核对处理 */ }
+        try {
+          await ctx.session.instructions?.entry?.put?.({
+            sessionID: sid,
+            key: 'swarm-role',
+            value: `你是本轮 swarm 的 dev 会话${name ? `（需求：${name}）` : ''}。` +
+              `只在收到 #dev 指令或被唤醒后干活，不要自己找活；判定权不在你（test 说了算）。`,
+          });
+        } catch { /* instructions 不可用就算了 */ }
+        try { writeRoundFor(runId, { sessions: { dev: sid } }); } catch { /* 台账写失败不挡派发 */ }
+        return { sid, created: true, line: `\n- dev ✓ \`${sid}\` · ${shown} · agent ${ROLES.dev.agent}（start 自动补建常驻会话）${warn}` };
+      } catch (e) {
+        return { error: oneLine(e?.message ?? e, 120), line: '\n⚠️ dev 常驻会话补建异常：派发照常，可手动重跑 start 重试' };
+      }
+    }
+
+    // 高风险软卡判定（10-30-swarm-approve-softcard）：high-risk 且无 approve 行 → 阻断。
+    // 纯读 timeline（kind='approve' presence），不写任何东西；dispatch 与 start-peek 共用。
+    function isApproveBlocked(runId, task) {
+      try {
+        if (!highRiskTasks([task], cfg.sensitivePaths).length) return false;
+        const rr = resolveRun(cwd, { run: runId, queue: effQueue(), cfgRunId: rawRunId });
+        return !readTimeline(rr.runDir).some((r) => r && r.taskId === task.id && r.kind === 'approve');
+      } catch {
+        return false;
+      }
+    }
+
     async function dispatchNext(run) {
       const runId = sanitizeRunId(run ?? currentRunId());
       const tasks = loadQueue(queueFor(runId));
@@ -995,24 +1063,13 @@ export default {
         }
         return { dispatched: null, drained: true };
       }
-      // 高风险软卡（10-30-swarm-approve-softcard）：high-risk 且无 approve 行 → 阻断派发。
-      // approve 只解锁、不改状态；本层纯读 timeline（kind='approve' presence），不写任何东西。
-      if (highRiskTasks([next], cfg.sensitivePaths).length) {
-        let approved = false;
-        try {
-          const rr = resolveRun(cwd, { run: runId, queue: effQueue(), cfgRunId: rawRunId });
-          approved = readTimeline(rr.runDir).some((r) => r && r.taskId === next.id && r.kind === 'approve');
-        } catch {
-          approved = false;
-        }
-        if (!approved) {
+      if (isApproveBlocked(runId, next)) {
           return {
             dispatched: null,
             drained: false,
             reason: `⛔ 高风险未批：${next.id}（risk=${next.risk ?? 'high'}）暂不派发。主会话先看 diff（git diff / git show <commit>）确认变更，再补批：/swarm_approve —— 调工具 swarm_approve {task_id: "${next.id}"}（多单批量用 {task_ids: ["${next.id}", ...]}）。批后自动解锁派发（approve 不改状态，只解锁）`,
           };
         }
-      }
       const r = await transition(runId, next.id, 'queued', { status: 'dev_doing', assignee: 'dev' }, { by: 'orchestrator', reason: 'dispatch' });
       if (!r.ok) return { dispatched: null, reason: r.message };
       await emitFor(runId, 'orchestrator', '[TASK-ASSIGN]', { task: next.id, wave: next.wave, to: 'dev', verify: next.verify_cmd });
@@ -1664,13 +1721,33 @@ export default {
             // P1：start 即授权派发 —— 清 pendingStart，此后 dev/test 认领才放行。
             try { writeMeta(cwd, startRun, { startedAt: new Date().toISOString(), pendingStart: false }); } catch { /* best-effort */ }
             bindSession(startRun, sessionID, 'host');
+            // dev 空转修复（11-05）：已有 dev_doing 不再派新单（保 wave 串行、防重复派发），
+            // 而是确保 dev 常驻会话存在并重发唤醒 —— 修“派发了没人动”的悬空。
+            let devLive = null;
+            try { devLive = loadQueue(qp).find((t) => t && t.status === 'dev_doing') ?? null; } catch { devLive = null; }
+            if (devLive) {
+              const ens = await ensureDevSession(startRun, name);
+              const wake = await wakeRole('dev', devLive, startRun);
+              return reply(
+                `已有进行中任务 ${devLive.id}（dev_doing，assignee=${devLive.assignee ?? '-'}），不重复派发${ens.line}${nameLine}` +
+                wakeLine(wake, 'dev', devLive.id),
+              );
+            }
+            // 派发前瞻：只有真会派下去才建会话（空轮/高风险被拒场景不留孤儿会话）。
+            let ensLine = '';
+            try {
+              const peek = loadQueue(qp).find((t) => t && t.status === 'queued') ?? null;
+              if (peek && !isApproveBlocked(startRun, peek)) {
+                ensLine = (await ensureDevSession(startRun, name)).line;
+              }
+            } catch { /* 前瞻失败不挡派发 */ }
             const r = await dispatchNext(startRun);
             if (!r.dispatched) {
               return reply(`无可派发任务（${r.drained ? '队列已空' : r.reason}）${nameLine}`);
             }
             return reply(
               `已派发 ${r.dispatched.id}（wave=${r.dispatched.wave}）→ dev［状态已流转：queued→dev_doing］\n` +
-              `验证命令：\`${r.dispatched.verify_cmd}\`${nameLine}` +
+              `验证命令：\`${r.dispatched.verify_cmd}\`${ensLine}${nameLine}` +
               wakeLine(r.wake, 'dev', r.dispatched.id),
             );
           } catch (e) {

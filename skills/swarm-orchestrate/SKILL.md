@@ -57,6 +57,7 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 
 - **默认主会话即 planner**：`/swarm-up` 不再另建 plan 会话（`plan = 当前会话`），直接在窗口里 `#plan 拆解 <需求>`；要旧行为加 `--plan-session new`。
 - **`/swarm-start` 是唯一派发授权**：`/swarm-up` 只开轮不派发；未 start 前 `swarm_claim/swarm_next` 会被闸门拒收（逃生口 `force:true`）。planner 入队后必须等人确认（门二）再执行 `/swarm-start`；主会话只负责把问题问出来，不代跑派发。
+- **start 自带执行者保障**：派发前自动补建缺失的 dev 常驻会话（用已分配的 roleModels，台账合并登记），缺了不用人肉 `up --force` 补；已有 `dev_doing` 时重跑 start 不重复派发，只重发唤醒（修悬空）。
 - **并行多轮**：run 解析优先级 = 显式 `run` > 任务归属（带 task_id 时）> 会话绑定（`round.json` 的 sessions/members）> 全局 `.swarm/current`。同一会话开新轮会被自动从旧轮摘走；不同窗口并行互不抢指针。
 - dev（会话 wake 为主）prompt = 任务 JSON + 验收标准 + `verify_cmd` + 上次 fail 的 `detail/failed_ids`（时间线现成，直接复用；自然语言 bug 全程不让人碰 dev 会话，主会话代跑唤醒）。
   - **prompt 首行写 `run=<runId>`**，并让子代理在工具调用里带上 `run`；插件也会按 `task_id` 兜底反查，但显式带上更稳。

@@ -482,7 +482,7 @@ describe('派发可见性（不再「不知道有没有跑」；显式 sessions 
     assert.match(woke.text, /你是 test/);
   });
 
-  test('未登记会话时给「未自动唤醒」而不是静默（显式 sessions）', async () => {
+  test('无登记会话时 start 自动补建 dev 会话并投递（不再静默跳过）', async () => {
     const { rmSync: rm } = await import('node:fs');
     // 台账只按 run 存放：清本轮 round.json 即算「未登记」（旧全局位已不参与读，
     // 那行 rm 只是顺手清掉镜像残留，删了也不影响本用例结论）
@@ -490,7 +490,13 @@ describe('派发可见性（不再「不知道有没有跑」；显式 sessions 
     rm(join(dir, '.trellis/swarm-state/round.json'), { force: true });
     await run('swarm_plan', { tasks: [{ id: 'W9-T2', wave: 'W9', stack: 'backend', title: '无台账', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd' , review: false}] });
     const out = await cmd('swarm-start', '--executor sessions --dev-backend-model opencode-go/deepseek-v4.1-flash --tester-model opencode-go/muse-spark-1.3-contributor');
-    assert.match(out, /未自动唤醒/);
+    assert.match(out, /已派发 W9-T2/);
+    assert.match(out, /start 自动补建常驻会话/);
+    assert.match(out, /唤醒投递结果/);
+    const devSid = roundState().sessions.dev;
+    assert.ok(devSid, '补建的 dev 会话应登记进台账');
+    const woke = promptCalls.slice(before).find((c) => c.sessionID === devSid);
+    assert.ok(woke, '应给新建 dev 会话发 #dev 指令');
   });
 });
 
@@ -1347,6 +1353,11 @@ describe('subagent 执行器（executor=subagents，默认；显式 sessions 回
       const ap = await run('swarm_approve', { run: 'SUBAG', task_id: firstQueued.id });
       assert.match(ap, /已批准/, '队首 high-risk 应可补批');
     }
+    // repair 语义：共享队列若有残留 dev_doing，先清场（否则 start 走“已有进行中”修复分支不派新单；
+    // W-RJ 是恒红门禁钉子户，done 过不了门禁，用 halt 移出 dev_doing）
+    for (const t of queueState().filter((x) => x.status === 'dev_doing')) {
+      await run('swarm_halt', { task_id: t.id, reason: '清场' });
+    }
     const before = promptCalls.length;
     const out = await cmd('swarm-start', '--run SUBAG --executor subagents --dev-model opencode-go/muse-spark-1.3-contributor --tester-model opencode-go/deepseek-v4.1-flash');
     assert.match(out, new RegExp(`已派发 ${firstQueued.id}`));
@@ -1857,6 +1868,8 @@ describe('/swarm-drained 只读判活（三态与 dispatchNext 同调）', () =>
     promptCountD = 0;
     const toolsD = new Map();
     const cmdsD = new Map();
+    const sessionsD = new Map();
+    let seqD = 0;
     const ctxD = {
       location: { directory: dirD },
       // 注意：故意不传 queue → 按 run 切分，本 describe 全隔离
@@ -1864,8 +1877,12 @@ describe('/swarm-drained 只读判活（三态与 dispatchNext 同调）', () =>
       model: { list: async () => [] },
       session: {
         prompt: async ({ sessionID, text }) => { promptsD.push(`[${sessionID}] ${text}`); promptCountD += 1; },
-        create: async ({ title }) => ({ id: 'd1', title }),
-        get: async () => undefined,
+        create: async ({ title, agent, model }) => {
+          const id = `d-${++seqD}`;
+          sessionsD.set(id, { id, title, agent, model });
+          return { id, title };
+        },
+        get: async ({ sessionID }) => sessionsD.get(sessionID),
         update: async () => {},
         switchModel: async () => {},
         hook: async () => {},
@@ -2009,7 +2026,7 @@ describe('/swarm-drained 只读判活（三态与 dispatchNext 同调）', () =>
     assert.deepEqual(liveTasks([{ status: 'dev_doing' }, { status: 'queued' }, { status: 'passed' }]).map((t) => t.status), ['dev_doing']);
   });
 
-  test('默认 hybrid：bare start 派发 dev 走会话唤醒口径（无登记会话则提示未登记，不短路）', async () => {
+  test('默认 hybrid：bare start 无 dev 会话时自动补建并投递（不断流）', async () => {
     await runD('swarm_plan', {
       run: 'DRSUB',
       tasks: [{ id: 'D-S1', wave: 'W1', stack: 'backend', title: '默认派发', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd' , review: false}],
@@ -2017,9 +2034,9 @@ describe('/swarm-drained 只读判活（三态与 dispatchNext 同调）', () =>
     const nBefore = promptCountD;
     const out = await cmdD('swarm-start', '--run DRSUB --dev-backend-model opencode-go/deepseek-v4.1-flash --tester-model opencode-go/muse-spark-1.3-contributor');
     assert.match(out, /已派发 D-S1/);
-    assert.match(out, /未自动唤醒/, 'hybrid dev 走会话唤醒口径：无登记会话则提示未登记');
-    assert.match(out, /未登记 dev 会话/);
-    assert.equal(promptCountD, nBefore + 1, '除本次回复外不得再调 session.prompt（无会话可唤醒，零投递）');
+    assert.match(out, /start 自动补建常驻会话/, '无登记会话时自动补建');
+    assert.match(out, /唤醒投递结果/, '补建后唤醒一次即达');
+    assert.equal(promptCountD, nBefore + 2, 'start 回复 + 一次唤醒投递');
     assert.equal(queueRows('DRSUB').find((t) => t.id === 'D-S1').status, 'dev_doing', '状态照常流转');
   });
 
@@ -2053,7 +2070,7 @@ describe('/swarm-drained 只读判活（三态与 dispatchNext 同调）', () =>
     // hybrid 缺省：dev 派发走会话唤醒口径（本 ctx 无登记会话则提示未登记，非 subagent 短路）
     const out = await cmdD('swarm-start', '--run DRHY --dev-backend-model opencode-go/deepseek-v4.1-flash --tester-model opencode-go/muse-spark-1.3-contributor');
     assert.match(out, /已派发 D-H1/);
-    assert.match(out, /执行器|未自动唤醒|未登记/, 'hybrid dev 派发应走会话唤醒口径');
+    assert.match(out, /唤醒投递结果/, 'hybrid dev 派发应走会话唤醒口径（自动补建后投递）');
     assert.doesNotMatch(out, /subagent 模式：编排会话用 subagent 工具直接派发/, 'hybrid dev 不得走整轮 subagent 短路');
     // test 唤醒在 hybrid 下短路（done 后 test 走子代理）
     await runD('swarm_claim', { run: 'DRHY', task_id: 'D-H1' });
@@ -3604,13 +3621,18 @@ describe('空轮不继承旧会话（W3-T1：空轮零继承 + 禁跨轮唤醒�
       // ③ 旧会话标题未被改
       assert.deepEqual(w.titles(), { plan: '旧会话标题 · plan', dev: '旧会话标题 · dev', test: '旧会话标题 · test' });
 
-      // ④ wakeRole：本轮未登记 → 未自动唤醒，且不向任何角色会话投递（只剩 start 自己的回执）
+      // ④ start 自动补建 dev 常驻会话 → 唤醒投递到新建会话，旧会话（stale）零投递、标题不动
       const before = w.promptCalls.length;
       const start = await w.cmd('swarm-start', '--run 空轮需求 --executor sessions --dev-backend-model opencode-go/m-ok --tester-model opencode-go/m-ok');
       assert.match(start, /已派发 ET-T1/);
-      assert.match(start, /未自动唤醒/);
-      assert.match(start, /未登记 dev 会话/);
-      assert.deepEqual(w.promptCalls.slice(before).filter((c) => c.sessionID !== 'caller'), [], '未登记时不得向任何会话 prompt');
+      assert.match(start, /唤醒投递结果/);
+      assert.match(start, /start 自动补建常驻会话/);
+      const newDev = JSON.parse(readFileSync(join(w.d, '.swarm/runs/空轮需求/round.json'), 'utf8')).sessions.dev;
+      assert.ok(newDev && !Object.values(STALE).includes(newDev), '补建的是全新 dev 会话');
+      const others = w.promptCalls.slice(before).filter((c) => c.sessionID !== 'caller');
+      assert.ok(others.length > 0, '应向新建 dev 会话投递');
+      assert.ok(others.every((c) => c.sessionID === newDev), '只许向新建 dev 会话投递，旧会话零投递');
+      assert.deepEqual(w.titles(), { plan: '旧会话标题 · plan', dev: '旧会话标题 · dev', test: '旧会话标题 · test' }, '旧会话标题仍不动');
     } finally {
       rmSync(w.d, { recursive: true, force: true });
     }
@@ -3657,13 +3679,18 @@ describe('空轮不继承旧会话（W3-T1：空轮零继承 + 禁跨轮唤醒�
       assert.deepEqual(healed.sessions, {}, 'N1：外来 sid 必须从 round.json 真删键（replaceSessions），不得留账');
       assert.equal(healed.name, '污染轮再命名', '改名照常落盘');
 
-      // ③ 自愈之后：本轮真的「未登记」，唤醒按未登记跳过，且不向任何会话投递
+      // ③ 自愈之后：halt 清场 ET-T2（done+test 会触发管线自动派发 ET-T3，halt 不会），
+      // 再 start：自动补建 dev 会话 → 派发 ET-T3 → 唤醒投递到新建会话，stale-dev 零投递
+      await w.run('swarm_halt', { run: '污染轮P', task_id: 'ET-T2', reason: '占位清场' });
       const before2 = w.promptCalls.length;
       const start2 = await w.cmd('swarm-start', '--run 污染轮P --executor sessions --dev-backend-model opencode-go/m-ok --tester-model opencode-go/m-ok');
       assert.match(start2, /已派发 ET-T3/);
-      assert.match(start2, /未自动唤醒/);
-      assert.match(start2, /未登记 dev 会话/);
-      assert.deepEqual(w.promptCalls.slice(before2).filter((c) => c.sessionID !== 'caller'), [], '自愈后不得向任何会话投递');
+      assert.match(start2, /唤醒投递结果/);
+      const newDev2 = JSON.parse(readFileSync(rFile, 'utf8')).sessions.dev;
+      assert.ok(newDev2 && newDev2 !== 'stale-dev', '补建的是全新 dev 会话');
+      const others2 = w.promptCalls.slice(before2).filter((c) => c.sessionID !== 'caller');
+      assert.ok(others2.length > 0 && others2.every((c) => c.sessionID === newDev2), '只许向新建 dev 会话投递');
+      assert.deepEqual(w.promptCalls.slice(before2).filter((c) => c.sessionID === 'stale-dev'), [], 'stale-dev 零投递');
     } finally {
       rmSync(w.d, { recursive: true, force: true });
     }
@@ -3701,8 +3728,13 @@ describe('空轮不继承旧会话（W3-T1：空轮零继承 + 禁跨轮唤醒�
       // 唤醒：未登记 → 不向任何旧会话投递
       const before = w.promptCalls.length;
       const start = await w.cmd('swarm-start', '--run 迁移轮M --executor sessions --dev-backend-model opencode-go/m-ok --tester-model opencode-go/m-ok');
-      assert.match(start, /未自动唤醒/);
-      assert.deepEqual(w.promptCalls.slice(before).filter((c) => c.sessionID !== 'caller'), [], '不得向旧会话投递');
+      assert.match(start, /已派发/);
+      assert.match(start, /唤醒投递结果/);
+      assert.match(start, /start 自动补建常驻会话/);
+      const newDev = JSON.parse(readFileSync(join(w.d, '.swarm/runs/迁移轮M/round.json'), 'utf8')).sessions.dev;
+      assert.ok(newDev, '补建的 dev 会话应登记');
+      const others = w.promptCalls.slice(before).filter((c) => c.sessionID !== 'caller');
+      assert.ok(others.length > 0 && others.every((c) => c.sessionID === newDev), '只许向新建 dev 会话投递，不得向旧会话投递');
     } finally {
       rmSync(w.d, { recursive: true, force: true });
     }
@@ -4124,6 +4156,25 @@ describe('按需模型门禁（start 硬拦：只索要实际 stack，不靠主�
     writeFileSync(qp, JSON.stringify({ id: 'GL-T1', wave: 'W1', title: '老任务', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', status: 'queued', retries: 0, updated_at: new Date().toISOString() }) + '\n');
     const out = await cmdG('swarm-start', '--run GATELEGACY');
     assert.match(out, /已派发 GL-T1/, '纯 legacy 轮裸 start 照旧派发（老行为零变）');
+  });
+
+  test('start 已有 dev_doing 不重复派发：只补建会话+重发唤醒（修空转）', async () => {
+    await runG('swarm_plan', {
+      run: 'GATEREP',
+      tasks: [
+        { id: 'GR-T1', wave: 'W1', stack: 'backend', title: '一单', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false },
+        { id: 'GR-T2', wave: 'W1', stack: 'backend', title: '二单', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false },
+      ],
+    });
+    const s1 = await cmdG('swarm-start', `--run GATEREP --dev-backend-model ${M1} --tester-model ${M2}`);
+    assert.match(s1, /已派发 GR-T1/);
+    const s2 = await cmdG('swarm-start', `--run GATEREP --dev-backend-model ${M1} --tester-model ${M2}`);
+    assert.match(s2, /已有进行中任务 GR-T1/);
+    assert.match(s2, /不重复派发/);
+    assert.doesNotMatch(s2, /已派发 GR-T2/, '不得趁机派第二单（保 wave 串行）');
+    const rows = JSON.parse(`[${readFileSync(join(dirG, '.swarm/runs/GATEREP/queue.jsonl'), 'utf8').split('\n').filter(Boolean).join(',')}]`);
+    assert.equal(rows.find((t) => t.id === 'GR-T1').status, 'dev_doing');
+    assert.equal(rows.find((t) => t.id === 'GR-T2').status, 'queued');
   });
 
   test('swarm_config 带出 stacks/missingModels（人工分配一眼看清）', async () => {
