@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 import { loadQueue, invalidate, transitionTask, enqueueTask, saveQueueAtomic, appendTimeline, requiredModels, TASK_STACKS } from '../lib/swarm-store.js';
 import { sessionRunIndex as boardSessionIndex } from '../lib/swarm-board-data.mjs'; // 看板同源（status 自报必须与 TUI 一致）
 import { createFileBus, eventId } from '../lib/swarm-filebus.js';
-import { checkGate, headCommit, matchPatterns, baseHead } from '../lib/swarm-gate.js';
+import { checkGate, headCommit, matchPatterns, baseHead, gitBranch } from '../lib/swarm-gate.js';
 import { parseTag, expandTag, expandTagCompact, ROLES, hasRole } from '../lib/swarm-roles.js';
 import { DEFAULT_ALLOWLIST, runVerify } from '../lib/swarm-exec.js';
 import {
@@ -1400,6 +1400,8 @@ export default {
               // 分栈 dev flags 同属实质（#3b：up 显式带分栈模型即按需建 dev 常驻会话，不给不建）
               if (hasVal(f.dev_backend_model) || hasVal(f.dev_backend)
                 || hasVal(f.dev_frontend_model) || hasVal(f.dev_frontend)) return true;
+              // --branch 同属实质（带了就走主路径核对+落盘，不回开场卡）
+              if (hasVal(f.branch)) return true;
               if (hasVal(f.roles)) return true;
               return false;
             })();
@@ -1510,6 +1512,30 @@ export default {
                 `2. 换个轮名：\`/swarm-up --run <新名字> ...\`（或不带 --run，用 --name 自动派生新轮）；\n` +
                 `3. 确认要混用旧轮：加 \`--force\` 重跑（旧任务保留，新会话登记到该轮）。`,
               );
+            }
+
+            // 本轮分支声明（11-06 单树复盘）：分支只能主会话开，开后 dev/test 全员走同一条，
+            // done 时分支门硬拦（当前分支 ≠ 声明即拒收）。只核对 + 落盘，
+            // 绝不自动 checkout（切分支是危险副作用，主会话手动切完重跑）。
+            // 名形非法 / 当前树不在该分支 → 拒收（零会话零落盘，meta 不写）。
+            let upBranch = null;
+            if (f.branch !== undefined && f.branch !== 'true') {
+              const want = String(f.branch ?? '').trim();
+              const shapeOk = /^[A-Za-z0-9_][A-Za-z0-9_.\/-]*$/.test(want) && !want.includes('..') && want.length <= 120;
+              if (!shapeOk) {
+                return reply(`❌ /swarm-up 参数错误：--branch 名形非法（只许字母数字/_/./-/，禁空格与 shell 字符，不许 ..）：\`${oneLine(want, 80)}\`。示例：\`/swarm-up --run ${upRun} --branch swarm/xxx\``);
+              }
+              let cur = null;
+              try { cur = await gitBranch(cwd, cfg.gitBin); } catch { cur = null; }
+              if (!cur || !cur.ok) {
+                const why = cur && cur.reason === 'detached' ? '当前是 detached HEAD' : '当前目录不是 git 仓';
+                return reply(`❌ /swarm-up 未建轮 —— ${why}，声明不了分支 ${want}。\n先在 git 仓里切好分支（\`git checkout -b ${want}\` 或切到已有分支），再重跑本命令（零会话零落盘）。`);
+              }
+              if (cur.branch !== want) {
+                return reply(`❌ /swarm-up 未建轮 —— 当前分支是 \`${cur.branch}\`，不是 --branch ${want}（插件绝不自动切分支）。\n手动切过去（\`git checkout ${want}\`，没有就 \`git checkout -b ${want}\`），再重跑本命令（零会话零落盘）。`);
+              }
+              upBranch = want;
+              try { writeMeta(cwd, upRun, { branch: want }); } catch { /* best-effort */ }
             }
 
             // ① 先校验模型：OpenCode 的 switchModel 对不存在的模型会静默成功，
@@ -1687,7 +1713,8 @@ export default {
                 : (isHybridUp ? hybridTail
                 : `\n\n下一步：${planHint}` + `${startGateNote}`));
             const roundLine = hasRound?.name ? `\n本轮：**${hasRound.name}**` : '';
-            return reply(`${head}${roundLine}${tail}${errors.length ? '\n\n（失败的会话没有创建，修正后重跑 /swarm-up 即可）' : ''}`);
+            const branchLine = upBranch ? `\n本轮分支：**${upBranch}**（当前树已核对，dev/test 全员走这条；dev 禁自建 worktree/分支，要隔离找主会话开）` : '';
+            return reply(`${head}${roundLine}${branchLine}${tail}${errors.length ? '\n\n（失败的会话没有创建，修正后重跑 /swarm-up 即可）' : ''}`);
           } catch (e) {
             return reply(`❌ /swarm-up 异常：${oneLine(e?.message ?? e, 200)}\n\n${String(e?.stack ?? '').split('\n').slice(0, 5).join('\n')}`);
           }
@@ -2671,6 +2698,12 @@ export default {
           if (cfg.gates?.lint) gateNames.push('lint');
           if (cfg.gates?.type) gateNames.push('type');
           if (cfg.gates?.tenant) gateNames.push('tenant');
+          // 本轮分支门（11-06 单树复盘）：meta.branch 有声明才进，无声明 legacy 零变。
+          let expectedBranch = null;
+          try {
+            const b = (readMeta(cwd, runId) ?? {}).branch;
+            if (typeof b === 'string' && b.trim()) { expectedBranch = b.trim(); gateNames.push('branch'); }
+          } catch { expectedBranch = null; }
           const gate = await checkGate({
             cwd,
             verify_cmd: task.verify_cmd,
@@ -2683,6 +2716,7 @@ export default {
             policyDeny: cfg.policyDeny,
             gitBin: cfg.gitBin,
             gates: gateNames,
+            expectedBranch,
             taskId: input.task_id,
             timelinePath: timelineFor(runId),
           });

@@ -155,7 +155,9 @@ sidebar 与 footer 立刻可见，零任务态非报错，不显示红 STALE）�
 开场卡禁令（逐字）：本轮无需历史数据，不要调 swarm_read_queue /swarm-status /swarm-drained，直接用 question 工具问完上面两项。
 
 拿到答案后重跑带参 `/swarm-up --run <空轮runId> --name <需求名>`（复用本空轮，不会再派生新轮；开场卡内已给出可复制的一条），
-然后回到**当前会话**（默认它就是 planner）`#plan 拆解 <需求>`；要另建 plan 会话加 `--plan-session new`。仅模型 flag（`--dev-model` / `--dev-backend-model` / `--dev-frontend-model` / `--tester-model` / `--reviewer-model`，裸写亦算）或 `--executor` 算实质 flag，有任一即走老行为直接建会话；单 `--name`（无任何模型/执行器 flag）不跳卡，仍回开场卡并回显已预填的需求名（空轮已建，见上一段）。
+然后回到**当前会话**（默认它就是 planner）`#plan 拆解 <需求>`；要另建 plan 会话加 `--plan-session new`。仅模型 flag（`--dev-model` / `--dev-backend-model` / `--dev-frontend-model` / `--tester-model` / `--reviewer-model`，裸写亦算）或 `--executor` 或 `--branch` 算实质 flag，有任一即走老行为直接建会话；单 `--name`（无任何模型/执行器 flag）不跳卡，仍回开场卡并回显已预填的需求名（空轮已建，见上一段）。
+
+单树（分支只能主会话开）：要隔离加 `--branch <名>`（如 `--run <轮> --branch swarm/xxx`；插件只核对当前树在该分支+落盘期望，绝不自动切分支——先手动切好再跑）。开后 dev/test 全员走同一条分支，done 自带分支门（在别的分支/自建 worktree 干活会被拒收退回 dev_doing）；dev 禁自建 worktree/分支。
 
 ---
 

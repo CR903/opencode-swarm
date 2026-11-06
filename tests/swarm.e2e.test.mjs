@@ -4410,6 +4410,62 @@ describe('按需模型门禁（start 硬拦：只索要实际 stack，不靠主�
     assert.match(ghost, /未在任何轮登记/);
     assert.match(ghost, /隐藏/);
   });
+
+  test('up --branch：非法名/不在该分支拒收（零会话零落盘），对了才落盘', async () => {
+    const orig = execFileSync('git', ['branch', '--show-current'], { cwd: dirG }).toString().trim();
+    execFileSync('git', ['checkout', '-qb', 'br-swarm-t1'], { cwd: dirG });
+    try {
+      const bad = await cmdG('swarm-up', `--run BRBAD --branch "a;b" --dev-backend-model ${M1} --tester-model ${M2}`);
+      assert.match(bad, /branch/i);
+      assert.doesNotMatch(bad, /✓/, '非法名不得建会话');
+      assert.equal(existsSync(join(dirG, '.swarm/runs/BRBAD/meta.json')), false, '拒收零落盘');
+      const mis = await cmdG('swarm-up', `--run BRMIS --branch some-other-branch --dev-backend-model ${M1} --tester-model ${M2}`);
+      assert.match(mis, /some-other-branch/);
+      assert.match(mis, /checkout|切换/, '指路手动切换，绝不自动切');
+      assert.equal(existsSync(join(dirG, '.swarm/runs/BRMIS/meta.json')), false, '拒收零落盘');
+      const ok = await cmdG('swarm-up', `--run BR1 --branch br-swarm-t1 --dev-backend-model ${M1} --tester-model ${M2}`);
+      assert.match(ok, /br-swarm-t1/);
+      assert.equal(JSON.parse(readFileSync(mFile('BR1'), 'utf8')).branch, 'br-swarm-t1', '对了才落盘');
+    } finally {
+      execFileSync('git', ['checkout', '-q', orig], { cwd: dirG });
+      execFileSync('git', ['branch', '-D', 'br-swarm-t1'], { cwd: dirG });
+    }
+  });
+
+  test('done 同分支门：同分支过，切分支拒，切回过（dev 自建分支干活会被拦）', async () => {
+    const orig = execFileSync('git', ['branch', '--show-current'], { cwd: dirG }).toString().trim();
+    execFileSync('git', ['checkout', '-qb', 'br-swarm-t2'], { cwd: dirG });
+    try {
+      await cmdG('swarm-up', `--run BRG --branch br-swarm-t2 --dev-backend-model ${M1} --tester-model ${M2}`);
+      await runG('swarm_plan', {
+        run: 'BRG',
+        tasks: [
+          { id: 'BG-T1', wave: 'W1', stack: 'backend', title: '一单', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false },
+          { id: 'BG-T2', wave: 'W1', stack: 'backend', title: '二单', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false },
+        ],
+      });
+      const F = `--dev-backend-model ${M1} --tester-model ${M2}`;
+      await cmdG('swarm-start', `--run BRG ${F}`);
+      const d1 = await runG('swarm_done', { run: 'BRG', task_id: 'BG-T1', summary: '做完' });
+      assert.match(d1, /门禁通过/, '同分支 done 照过');
+      // 切到别的分支（模拟 dev 自建分支干活）：done 被分支门拦下
+      execFileSync('git', ['checkout', '-qb', 'br-swarm-evil'], { cwd: dirG });
+      await cmdG('swarm-start', `--run BRG ${F}`);
+      const d2 = await runG('swarm_done', { run: 'BRG', task_id: 'BG-T2', summary: '在错分支做完' });
+      assert.match(d2, /gate=branch/, '分支不对 done 被拒');
+      assert.match(d2, /br-swarm-t2/, '拒收点名本轮分支');
+      const rows = JSON.parse(`[${readFileSync(qFile('BRG'), 'utf8').split('\n').filter(Boolean).join(',')}]`);
+      assert.equal(rows.find((t) => t.id === 'BG-T2').status, 'dev_doing', '拒收后退回 dev_doing');
+      // 切回：重跑 done 即过
+      execFileSync('git', ['checkout', '-q', 'br-swarm-t2'], { cwd: dirG });
+      const d3 = await runG('swarm_done', { run: 'BRG', task_id: 'BG-T2', summary: '切回重交' });
+      assert.match(d3, /门禁通过/, '切回后 done 照过');
+    } finally {
+      execFileSync('git', ['checkout', '-q', orig], { cwd: dirG });
+      execFileSync('git', ['branch', '-D', 'br-swarm-t2'], { cwd: dirG });
+      try { execFileSync('git', ['branch', '-D', 'br-swarm-evil'], { cwd: dirG }); } catch { /* 已切回时同名残留才删 */ }
+    }
+  });
 });
 
 

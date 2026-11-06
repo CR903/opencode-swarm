@@ -26,7 +26,7 @@ import { sanitizeRunId, resolveRun, writeCurrentRunId, listRuns, migrateLegacy, 
 import { parseCommand, runVerify, DEFAULT_ALLOWLIST } from '../lib/swarm-exec.js';
 import { eventId, createChannel } from '../lib/swarm-events.js';
 import { createFileBus, eventId as busEventId } from '../lib/swarm-filebus.js';
-import { checkGate, registerGate, GATES, FORBIDDEN, matchPatterns } from '../lib/swarm-gate.js';
+import { checkGate, registerGate, branchGate, GATES, FORBIDDEN, matchPatterns } from '../lib/swarm-gate.js';
 import { parseTag, expandTag, expandTagCompact, renderTaskBlock, ROLES, TAG_INDEX, registerRole, hasRole, rebuildTagIndex } from '../lib/swarm-roles.js';
 import { writeRound, readRound } from '../lib/swarm-sessions.js';
 
@@ -262,6 +262,14 @@ describe('gate', () => {
   test('无 verdict 时只看命令', async () => {
     const r = await checkGate({ cwd: dir, verify_cmd: green });
     assert.equal(r.ok, true);
+  });
+
+  test('branchGate：未声明分支直接过（legacy 零变，不碰 git）', async () => {
+    for (const opts of [{ cwd: dir }, { cwd: dir, expectedBranch: '' }, { cwd: dir, expectedBranch: '   ' }]) {
+      const r = await branchGate(opts);
+      assert.equal(r.ok, true, JSON.stringify(opts));
+      assert.match(r.reason, /no branch declared/);
+    }
   });
 
   test('requireVerdict 时缺 verdict 被拒', async () => {
@@ -1105,6 +1113,12 @@ describe('role registry', () => {
     assert.match(c, /裸命令名/);
     assert.match(c, /make -C/);
     assert.match(c, /禁.*shell.*拼接|禁 shell 拼接/);
+  });
+
+  test('dev 契约含单树铁律（禁自建 worktree/分支，11-06 复盘）', () => {
+    const c = ROLES.dev.contract;
+    assert.match(c, /worktree/);
+    assert.match(c, /主树|同一分支/);
   });
 
   test('一行 registerRole 生效且索引重建', () => {

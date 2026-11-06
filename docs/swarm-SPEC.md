@@ -43,7 +43,7 @@ tag 由插件的 `session.prompt` hook 展开：角色契约 + 任务详情 + �
 
 | 命令 | 作用 |
 |---|---|
-| `/swarm-up [--dev-model c/d --dev-backend-model b/b --tester-model e/f] [--name 需求名] [--new] [--dry-run]` | 开轮只建空轮（模型可在 start 时再给）；带模型 flag 则先校验再按需建 dev 常驻会话并按需求命名；同名非空轮默认问复用还是新开（`--new` 强制派生） |
+| `/swarm-up [--dev-model c/d --dev-backend-model b/b --tester-model e/f] [--name 需求名] [--new] [--dry-run] [--branch <分支>]` | 开轮只建空轮（模型可在 start 时再给）；带模型 flag 则先校验再按需建 dev 常驻会话并按需求命名；同名非空轮默认问复用还是新开（`--new` 强制派生）；`--branch` 声明本轮分支（只核对当前树+落盘，绝不自动切；开后 dev/test 全员走同一条，done 自带分支门，dev 禁自建 worktree/分支） |
 | `/swarm-start [--dev-backend-model b/b#high --dev-frontend-model f/f --tester-model e/f --reviewer-model r/r] [--name 需求名] [--no-wake]` | 按需模型门禁（缺啥硬拦；模型值可选带 `#variant` 思考强度，错强度拒收并列可用项）→ 派发第一个 queued 任务 + 唤醒 dev 会话 |
 | `/swarm-status` | 轮次名 + 会话表（role/session/title/model/手上任务）+ 队列 + 通道尾 + 卡住的任务 |
 | `/swarm-models [--provider p] [--search q]` | 列可用模型，用于挑 `provider/model` |

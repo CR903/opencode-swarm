@@ -97,6 +97,8 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 
 7. **verify_cmd 入队前自查**：planner 契约里有三条（单命令/裸命令名/禁 shell 拼接，跨目录用 `make -C`）。入队结果见 `contains shell separator` 就是 planner 漏检——打回重拆，不要让 dev 去撞门禁（11-06 批量编辑轮四单全犯、dev 空转一轮就是这么来的）。
 
+8. **单树铁律（分支只能主会话开）**：dev/test 全员只认当前轮的主树；dev 禁自建 worktree、禁自建分支、禁切分支（11-06：dev 自建 `be-batchtids-gate`，verify/test 各看各的树）。要隔离由主会话开：`/swarm-up --run <轮> --branch <名>`（插件只核对当前树、落盘期望，绝不自动切；先手动切好再跑）。开后 done 自带分支门（当前分支 ≠ 声明即拒收退回 dev_doing）。test/reviewer 若发现改动不在本轮树上，直接 fail/打回，不背书。
+
 异常升级：HALT 已有推送（requester 会收到"⛔ HALT 通知 … 恢复：/swarm-retry --task X"），
 收到即停轮询、原话转述给用户，等拍板；高风险任务（`risk=high` 或命中 `sensitivePaths`）
 把"⚠️ 高风险：建议两人复核"原文转述，不自己放行。
