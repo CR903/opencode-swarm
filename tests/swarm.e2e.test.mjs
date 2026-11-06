@@ -3372,7 +3372,7 @@ describe('高风险软卡 approve（10-30-swarm-approve-softcard，五例锁死�
 
   after(() => { rmSync(dirA, { recursive: true, force: true }); });
 
-  test('无批阻断：high-risk 无 approve 行派发被拦（文案含 id + /swarm_approve + diff 指引），状态不动', async () => {
+  test('无批阻断：high-risk 无 approve 行派发被拦（文案含 id + /swarm_approve + 新任务看范围指引），状态不动', async () => {
     await runA('swarm_plan', {
       tasks: [{ id: 'H-AP1', wave: 'W1', stack: 'backend', title: '高风险改动', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', review: false }],
     });
@@ -3381,7 +3381,9 @@ describe('高风险软卡 approve（10-30-swarm-approve-softcard，五例锁死�
     assert.match(out, /H-AP1/);
     assert.match(out, /swarm_approve/);
     assert.match(out, /\/swarm_approve/);
-    assert.match(out, /diff/);
+    assert.match(out, /任务范围 \+ 验收标准/, '新任务（无提交）指引看范围验收，不找 diff');
+    assert.match(out, /尚无提交/);
+    assert.doesNotMatch(out, /git show/, '无提交时不得让人去看 diff');
     assert.equal(qRowsA().find((t) => t.id === 'H-AP1').status, 'queued', '阻断不得改状态');
   });
 
@@ -3842,8 +3844,7 @@ describe('唤醒去重（1.6.0 token-economy：首条全量 + 同会话增量）
       assert.match(wake1, /你是 dev/);
       assert.match(wake1, /WC-T1/);
       assert.match(wake1, /只做被指派的那一个任务/, '首条唤醒发全量契约');
-      assert.equal(roundOf(w, 'WAKEC').woken?.dev, devSid, '首条唤醒成功后 woken 落盘');
-
+      assert.equal(roundOf(w, 'WAKEC').woken?.dev, devSid, '首条唤醒成功后 woken 落盘')
       // 清场 WC-T1（halt 不触发管线自动派发），再 start 派 WC-T2 → 同会话增量唤醒
       await w.run('swarm_halt', { run: 'WAKEC', task_id: 'WC-T1', reason: '让位' });
       const before = w.promptCalls.length;
@@ -3869,6 +3870,60 @@ describe('唤醒去重（1.6.0 token-economy：首条全量 + 同会话增量）
       const wake3Calls = w.promptCalls.slice(before3).filter((c) => c.sessionID === 'w-fake-new');
       assert.equal(wake3Calls.length, 1, '新 sid 应收到唤醒');
       assert.match(wake3Calls[0].text, /只做被指派的那一个任务/, 'sid 变化自动回全量契约');
+    } finally {
+      rmSync(w.d, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('审批指引分新鲜/返修（1.6.x 文案修：无提交看范围，有提交看 diff）', () => {
+  // 独立 harness：start 会切 current 指针，与其它 describe 共 dir 必串轮。
+  const makeWorld = async () => {
+    const d = mkdtempSync(join(tmpdir(), 'swarm-aprhint-'));
+    writeFileSync(join(d, 'ok.mjs'), 'process.exit(0);\n');
+    const prompts = [];
+    const toolsM = new Map();
+    const cmdsM = new Map();
+    const ctxM = {
+      location: { directory: d },
+      options: { channel: 'swarm-aprhint-e2e', maxRetries: 3, verifyTimeoutMs: 20_000 },
+      model: { list: async () => [] },
+      session: {
+        prompt: async ({ sessionID, text }) => { prompts.push(`[${sessionID}] ${text}`); },
+        create: async ({ title }) => ({ id: 'h1', title }),
+        get: async () => undefined,
+        update: async () => {},
+        switchModel: async () => {},
+        hook: async () => {},
+      },
+      command: { transform: async (fn) => fn({ add: (x) => cmdsM.set(x.name, x) }) },
+      tool: { transform: async (fn) => fn({ add: (x) => toolsM.set(x.name, x) }) },
+    };
+    await plugin.setup(ctxM);
+    return {
+      d, prompts,
+      run: async (name, input) => (await toolsM.get(name).execute(withForce(name, input))).content,
+      cmd: async (name, text = '', sessionID = 'caller') => {
+        await cmdsM.get(name).execute({ sessionID, prompt: { text } });
+        return prompts.at(-1);
+      },
+    };
+  };
+
+  test('有提交的看 diff（git show 短 hash），无提交的不找 diff，状态都不动', async () => {
+    const w = await makeWorld();
+    try {
+      await w.run('swarm_plan', {
+        run: 'APRHINT2',
+        tasks: [{ id: 'AH-OLD', wave: 'W1', stack: 'backend', title: '返修', acceptance: 'exit 0', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', review: false, commit: 'abcdef1234567890' }],
+      });
+      const out = await w.cmd('swarm-start', '--run APRHINT2 --dev-backend-model opencode-go/deepseek-v4.1-flash --tester-model opencode-go/muse-spark-1.3-contributor');
+      assert.match(out, /无可派发/);
+      assert.match(out, /AH-OLD/);
+      assert.match(out, /git show abcdef123456/, '有提交时指引看 diff（短 hash）');
+      assert.doesNotMatch(out, /尚无提交/);
+      const rows = JSON.parse(`[${readFileSync(join(w.d, '.swarm/runs/APRHINT2/queue.jsonl'), 'utf8').split('\n').filter(Boolean).join(',')}]`);
+      assert.equal(rows.find((t) => t.id === 'AH-OLD').status, 'queued', '阻断不得改状态');
     } finally {
       rmSync(w.d, { recursive: true, force: true });
     }

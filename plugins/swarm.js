@@ -1077,6 +1077,19 @@ export default {
       }
     }
 
+    // 审批指引文案（1.6.x 修）：新任务尚无提交，看范围 + 验收；
+    // 返修/已有提交，看 diff。只返"看什么"，调用方自己接"补批"衔接。
+    // 纯文案，行为零变；永不抛错。
+    function approveHint(task) {
+      try {
+        const c = task && typeof task.commit === 'string' ? task.commit.trim() : '';
+        if (c) return `主会话先看 diff（git show ${c.slice(0, 12)}）确认变更`;
+        return '主会话先看任务范围 + 验收标准（尚无提交、无 diff 可看）确认可做';
+      } catch {
+        return '主会话确认';
+      }
+    }
+
     async function dispatchNext(run) {
       const runId = sanitizeRunId(run ?? currentRunId());
       const tasks = loadQueue(queueFor(runId));
@@ -1093,7 +1106,7 @@ export default {
           return {
             dispatched: null,
             drained: false,
-            reason: `⛔ 高风险未批：${next.id}（risk=${next.risk ?? 'high'}）暂不派发。主会话先看 diff（git diff / git show <commit>）确认变更，再补批：/swarm_approve —— 调工具 swarm_approve {task_id: "${next.id}"}（多单批量用 {task_ids: ["${next.id}", ...]}）。批后自动解锁派发（approve 不改状态，只解锁）`,
+            reason: `⛔ 高风险未批：${next.id}（risk=${next.risk ?? 'high'}）暂不派发。${approveHint(next)}，再补批：/swarm_approve —— 调工具 swarm_approve {task_id: "${next.id}"}（多单批量用 {task_ids: ["${next.id}", ...]}）。批后自动解锁派发（approve 不改状态，只解锁）`,
           };
         }
       const r = await transition(runId, next.id, 'queued', { status: 'dev_doing', assignee: 'dev' }, { by: 'orchestrator', reason: 'dispatch' });
@@ -1925,7 +1938,7 @@ export default {
               `### 队列\n${table(tasks)}\n\n` +
               `### 质量\n- ${roundsLine}\n- ${dispLine}\n\n` +
               (risky.length ? `### 高风险提示\n⚠️ 高风险：建议两人复核：${risky.map((t) => t.id).join(', ')}\n\n` : '') +
-              (pending.length ? `### 待批（pending-approval）\n${pending.map((t) => `- ⏳ ${t.id} 高风险未批（${t.status}）：主会话确认 diff 后调 \`swarm_approve\` {\`task_id\`: "${t.id}"} 放行`).join('\n')}\n\n` : '') +
+              (pending.length ? `### 待批（pending-approval）\n${pending.map((t) => `- ⏳ ${t.id} 高风险未批（${t.status}）：${approveHint(t)}后调 \`swarm_approve\` {\`task_id\`: "${t.id}"} 放行`).join('\n')}\n\n` : '') +
               (stuck.length ? `### 需人工关注\n${stuck.map((t) => `- ${t.id} 重试 ${t.retries} 次`).join('\n')}\n\n` : '') +
               (idle.length ? `### 疑似无人接单\n${idle.map((x) => `- ${x.id} ${x.status} 已停留 ${x.dur}（超15分钟无进展，疑似无人接单：去对应会话确认是否跑起来，或 /swarm-retry 重派）`).join('\n')}\n\n` : '') +
               `### 通道最近事件\n${tail || '(无)'}`,
@@ -2557,7 +2570,7 @@ export default {
               const rrPre = resolveRun(cwd, { run: runId, queue: effQueue(), cfgRunId: rawRunId });
               const approved = readTimeline(rrPre.runDir).some((row) => row && row.taskId === pre.id && row.kind === 'approve');
               if (!approved) {
-                return { content: `⛔ 高风险未批：${pre.id}（risk=${pre.risk ?? 'high'}）不许认领（run=${runId}，状态仍在 queued）。主会话确认 diff 后补批：调工具 swarm_approve {task_id: "${pre.id}"}（多单批量用 {task_ids: [...]}）。批后自动解锁（确认要绕过加 force:true）` };
+                return { content: `⛔ 高风险未批：${pre.id}（risk=${pre.risk ?? 'high'}）不许认领（run=${runId}，状态仍在 queued）。${approveHint(pre)}后补批：调工具 swarm_approve {task_id: "${pre.id}"}（多单批量用 {task_ids: [...]}）。批后自动解锁（确认要绕过加 force:true）` };
               }
             }
           } catch { /* 预检失败走老路（transition 照常），不误拦 */ }
@@ -2588,7 +2601,7 @@ export default {
               if (!approved) {
                 claimTip = input.force === true
                   ? `\n⚠️ 高风险未批：${r.task.id} 系 force:true 绕过审批门认领（审计可见，请尽快补批：swarm_approve {task_id: "${r.task.id}"}）`
-                  : `\n⚠️ 高风险未批：${r.task.id} 尚未补批。主会话确认 diff 后补批：调工具 swarm_approve {task_id: "${r.task.id}"}`;
+                  : `\n⚠️ 高风险未批：${r.task.id} 尚未补批。${approveHint(r.task)}后补批：调工具 swarm_approve {task_id: "${r.task.id}"}`;
               }
             }
           } catch { claimTip = ''; }
