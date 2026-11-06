@@ -75,6 +75,35 @@ describe('store', () => {
     }
   });
 
+  test('入队硬拦 verify_cmd：shell 拼接/路径/cd 在 plan 即拒收（11-06 复盘，不等门禁）', () => {
+    for (const [id, cmd] of [
+      ['VX-1', 'cd x && go test ./...'],
+      ['VX-2', 'go test ./... | tail -5'],
+      ['VX-3', './scripts/tenant-check.sh --all'],
+      ['VX-4', 'cd smarterlab-backend && make gate'],
+    ]) {
+      const r = enqueueTask(queue, emptyTask({ id, verify_cmd: cmd }));
+      assert.equal(r.ok, false, `${cmd} 应在入队被拒`);
+      assert.match(r.reason, /verify_cmd/);
+      assert.match(r.reason, /make -C/, '拒收须给合规改写指引');
+    }
+    assert.equal(loadQueue(queue).some((t) => t.id.startsWith('VX-')), false, '拒收零写行');
+  });
+
+  test('入队放行合规 verify_cmd：make -C 单命令照常进；自定义 allowlist 透传不误拦', () => {
+    const ok = enqueueTask(queue, emptyTask({ id: 'VO-1', verify_cmd: 'make -C smarterlab-backend gate' }));
+    assert.equal(ok.ok, true, ok.reason);
+    const custom = enqueueTask(queue, emptyTask({ id: 'VA-1', verify_cmd: 'task build' }), null, { allowlist: [...DEFAULT_ALLOWLIST, 'task'] });
+    assert.equal(custom.ok, true, custom.reason);
+  });
+
+  test('wave 非 string 被拒且点名形状', () => {
+    const r = enqueueTask(queue, emptyTask({ id: 'VW-1', wave: 2 }));
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /wave/);
+    assert.match(r.reason, /W1/, '须点名期望形状');
+  });
+
   test('CAS 状态不符时拒绝', () => {
     const r = casTransition(queue, 'W1-T1', 'passed', { status: 'halted' });
     assert.equal(r.ok, false);

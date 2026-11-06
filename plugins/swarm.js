@@ -1782,7 +1782,10 @@ export default {
             } catch { /* 前瞻失败不挡派发 */ }
             const r = await dispatchNext(startRun);
             if (!r.dispatched) {
-              return reply(`无可派发任务（${r.drained ? '队列已空' : r.reason}）${nameLine}`);
+              // 待批分流（1.6.x 修）：“无可派发”是真空轮/进行中占用的说法；
+              // 高风险等批是“等你拍板”，前缀必须分开，否则用户以为坏了。
+              const waitApprove = !r.drained && /高风险未批/.test(r.reason ?? '');
+              return reply(`${waitApprove ? '等你拍板' : '无可派发任务'}（${r.drained ? '队列已空' : r.reason}）${nameLine}`);
             }
             return reply(
               `已派发 ${r.dispatched.id}（wave=${r.dispatched.wave}）→ dev［状态已流转：queued→dev_doing］\n` +
@@ -2507,7 +2510,7 @@ export default {
               results.push(`${row.id ?? '?'}: frozen（本轮已冻结，拒收）`);
               continue;
             }
-            const r = enqueueTask(qp, row, timelineFor(runId), { by: 'plan', reason: 'create' });
+            const r = enqueueTask(qp, row, timelineFor(runId), { by: 'plan', reason: 'create', allowlist: cfg.allowlist });
             if (r.ok) enqueued += 1;
             results.push(`${row.id ?? '?'}: ${r.ok ? (row?.hotfix === true ? 'queued (HOTFIX)' : 'queued') : r.reason}`);
           }

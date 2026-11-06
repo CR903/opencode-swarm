@@ -128,6 +128,15 @@ describe('planning', () => {
     assert.equal(s.length, 1);
     assert.equal(s[0].status, 'queued');
   });
+
+  test('plan 硬拦 shell 拼接 verify_cmd：拒收+给 make -C 指引，零写行', async () => {
+    const out = await run('swarm_plan', {
+      tasks: [{ id: 'VX-E1', wave: 'W1', stack: 'backend', title: '坏命令', acceptance: 'ok', verify_cmd: 'cd x && go test ./...', testing: 'x', review: false }],
+    });
+    assert.match(out, /VX-E1: invalid verify_cmd/);
+    assert.match(out, /make -C/);
+    assert.equal(queueState().some((t) => t.id === 'VX-E1'), false, '拒收零写行');
+  });
 });
 
 describe('dev → gate → test 闭环', () => {
@@ -3377,7 +3386,8 @@ describe('高风险软卡 approve（10-30-swarm-approve-softcard，五例锁死�
       tasks: [{ id: 'H-AP1', wave: 'W1', stack: 'backend', title: '高风险改动', acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', review: false }],
     });
     const out = await cmdA('swarm-start', '--dev-backend-model opencode-go/deepseek-v4.1-flash --tester-model opencode-go/muse-spark-1.3-contributor');
-    assert.match(out, /无可派发/);
+    assert.match(out, /等你拍板/, '待批场景前缀是等你拍板，不是无可派发');
+    assert.doesNotMatch(out, /无可派发任务/, '待批不得说无可派发（会误导以为坏了）');
     assert.match(out, /H-AP1/);
     assert.match(out, /swarm_approve/);
     assert.match(out, /\/swarm_approve/);
@@ -3918,7 +3928,7 @@ describe('审批指引分新鲜/返修（1.6.x 文案修：无提交看范围，
         tasks: [{ id: 'AH-OLD', wave: 'W1', stack: 'backend', title: '返修', acceptance: 'exit 0', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', risk: 'high', review: false, commit: 'abcdef1234567890' }],
       });
       const out = await w.cmd('swarm-start', '--run APRHINT2 --dev-backend-model opencode-go/deepseek-v4.1-flash --tester-model opencode-go/muse-spark-1.3-contributor');
-      assert.match(out, /无可派发/);
+      assert.match(out, /等你拍板/);
       assert.match(out, /AH-OLD/);
       assert.match(out, /git show abcdef123456/, '有提交时指引看 diff（短 hash）');
       assert.doesNotMatch(out, /尚无提交/);
