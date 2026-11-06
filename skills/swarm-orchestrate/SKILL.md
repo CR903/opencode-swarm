@@ -95,6 +95,8 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 
 6. **三笔账规避（返工税）**：planner 拆任务时 acceptance 必须枚举对称路径（读写删三端、通过/驳回两分支——“只修一半”死在这）；reviewer 出结论前先 grep 全仓同类实现（有现成 helper 而新写一套→Important 打回——“两处各写一套”死在这）；dev 动手前先找后写。口径没写就是流程的债，不记模型的账。
 
+7. **verify_cmd 入队前自查**：planner 契约里有三条（单命令/裸命令名/禁 shell 拼接，跨目录用 `make -C`）。入队结果见 `contains shell separator` 就是 planner 漏检——打回重拆，不要让 dev 去撞门禁（11-06 批量编辑轮四单全犯、dev 空转一轮就是这么来的）。
+
 异常升级：HALT 已有推送（requester 会收到"⛔ HALT 通知 … 恢复：/swarm-retry --task X"），
 收到即停轮询、原话转述给用户，等拍板；高风险任务（`risk=high` 或命中 `sensitivePaths`）
 把"⚠️ 高风险：建议两人复核"原文转述，不自己放行。

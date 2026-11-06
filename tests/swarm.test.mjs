@@ -1070,6 +1070,14 @@ describe('role registry', () => {
     assert.equal(TAG_INDEX.get('reviewer'), 'reviewer');
   });
 
+  test('planner 契约含 verify_cmd 三条自查（单命令/裸命令名/禁拼接，11-06 复盘）', () => {
+    const c = ROLES.plan.contract;
+    assert.match(c, /单命令/);
+    assert.match(c, /裸命令名/);
+    assert.match(c, /make -C/);
+    assert.match(c, /禁.*shell.*拼接|禁 shell 拼接/);
+  });
+
   test('一行 registerRole 生效且索引重建', () => {
     registerRole('security', {
       tag: ['security', '#security'], agent: null, modelKey: 'security',
