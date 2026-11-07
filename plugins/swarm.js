@@ -1209,6 +1209,102 @@ export default {
       return { ok: true };
     }
 
+    /**
+     * start 两栖共用体（一条龙）：`/swarm-start` 命令与 `swarm_start` 工具同源，
+     * 同一份派发逻辑（队列前置→执行器/模型门禁→命名→pendingStart→派发/唤醒）。
+     * @param {object} f flags（命令：parseFlags(prompt.text)；工具：结构化 input 映射，同键名）
+     * @param {string|null} sessionID 调用会话（host 绑定 + notify.requester + 改名目标）
+     * @param {(text:string)=>Promise<unknown>} reply 中途消息通道（命令：prompt 回会话；工具：收集进 content）
+     * @returns {Promise<string>} 终态文本（调用方投递：命令 reply，工具 content）
+     */
+    async function doStart(f, sessionID, reply) {
+      if (f.queue) runtimeQueue = f.queue;
+      if (f.channel) cfg.channel = f.channel;
+      if (f.no_wake === 'true') cfg.autoWake = false;
+      if (f.wake === 'true') cfg.autoWake = true;
+      // 会话优先：并行两轮时，用当前窗口所属的轮，而不是全局 current（后者可能被另一轮抢走）。
+      const startRun = sanitizeRunId(cmdRun(f) ?? runIdForSession(cwd, sessionID) ?? currentRunId());
+      // 失败零落盘：先判队列存在（不存在直接回，不写 meta 不动 current），
+      // 再 applyExecutorFlags（含模型校验），合法才 writeCurrentRunId。
+      const qp = queueFor(startRun);
+      if (!existsSync(qp)) return `swarm: 队列不存在 ${displayPath(cwd, qp)}（run=${startRun}），先让 planner 写入（#plan）。` + suggestText(cwd, startRun);
+      const execStart = await applyExecutorFlags(startRun, f);
+      if (execStart.error) return `❌ /swarm-start 参数错误：${execStart.error}`;
+      // 按需模型门禁（硬拦，不靠主会话自觉）：按队列实际 stack 索要模型——
+      // 只含 backend 的轮不要 dev_frontend，只含 frontend 的不要 dev_backend；
+      // 纯 legacy 轮（任务无 stack）零要求。缺啥拒收：不认领 current、不改名、不清 pendingStart、不派发。
+      let reqModels = { stacks: [], missing: [] };
+      try {
+        const allTasks = loadQueue(qp);
+        let rmsNow = {};
+        try { rmsNow = (readMeta(cwd, startRun) ?? {}).roleModels ?? {}; } catch { rmsNow = {}; }
+        reqModels = requiredModels(allTasks, rmsNow);
+      } catch { reqModels = { stacks: [], missing: [] }; }
+      if (reqModels.missing.length) {
+        const flags = reqModels.missing.map((m) => m.flag).join(' ');
+        return '❌ /swarm-start 模型未配齐（run=' + startRun + '，本轮 stack：' + (reqModels.stacks.join('/') || '-') + '）——门禁硬拦，未派发、未清 pendingStart。\n' +
+          reqModels.missing.map((m) => '- ' + m.key + '：' + m.reason).join('\n') + '\n' +
+          '补齐后重跑：`/swarm-start --run ' + startRun + ' ' + flags + ' <provider/model>…`（legacy --dev-model 可通配前后端；模型名查 `/swarm-models --search <关键词>`）。';
+      }
+      // #2 空轮先建议：queue 为空且有同名显示名的非空候选 → 直接回指引，
+      // 不认领 current、不改名、不清 pendingStart（零落盘；无候选走老路）。
+      try {
+        if (loadQueue(qp).length === 0) {
+          const sug = suggestText(cwd, startRun);
+          if (sug) return `无可派发任务（队列已空，run=${startRun}）` + sug;
+        }
+      } catch { /* 读失败走老路 */ }
+      if (cmdRun(f)) writeCurrentRunId(cwd, startRun); // 显式 --run 即认领该轮（队列存在 + 执行器合法才认领）
+
+      // 命名：--name 优先；否则沿用 #plan 时落盘的需求名。
+      // 用户明确要的行为：「给定需求后，通过 start 应该把当前会话改成需求的名字」。
+      const pending = oneLine(f.name ?? f.title ?? '', 60);
+      const name = pending || roundNameFor(startRun);
+      if (name) {
+        const r = await nameRound(name, { currentSessionID: sessionID, run: startRun });
+        if (r.errors.length) await reply(`⚠️ 部分会话改名失败：\n${r.errors.map((x) => `- ${x}`).join('\n')}`);
+      }
+
+      // FileBus 本地通道：run 目录 + meta 确保存在即可，无外部二进制可调。
+      try { ensureRunMeta(cwd, startRun, name ? { name } : undefined); } catch { /* best-effort */ }
+      // HALT 推送目标：记录当前 sessionID（每次 start 覆盖，最新编排者为准；/swarm-up 不记）
+      try {
+        if (typeof sessionID === 'string' && sessionID.trim()) writeMeta(cwd, startRun, { notify: { requester: sessionID } });
+      } catch { /* best-effort */ }
+      const nameLine = name ? `\n本轮：**${name}**（run=${startRun}）` : '\n（本轮没有需求名：用 `/swarm-up --name 需求名` 或 `#plan <需求>` 可以让三个会话按需求命名）';
+      // P1：start 即授权派发 —— 清 pendingStart，此后 dev/test 认领才放行。
+      try { writeMeta(cwd, startRun, { startedAt: new Date().toISOString(), pendingStart: false }); } catch { /* best-effort */ }
+      bindSession(startRun, sessionID, 'host');
+      // dev 空转修复（11-05）：已有 dev_doing 不再派新单（保 wave 串行、防重复派发），
+      // 而是确保 dev 常驻会话存在并重发唤醒 —— 修“派发了没人动”的悬空。
+      let devLive = null;
+      try { devLive = loadQueue(qp).find((t) => t && t.status === 'dev_doing') ?? null; } catch { devLive = null; }
+      if (devLive) {
+        const ens = await ensureDevSession(startRun, name);
+        const wake = await wakeRole('dev', devLive, startRun);
+        return `已有进行中任务 ${devLive.id}（dev_doing，assignee=${devLive.assignee ?? '-'}），不重复派发${ens.line}${nameLine}` +
+          wakeLine(wake, 'dev', devLive.id);
+      }
+      // 派发前瞻：只有真会派下去才建会话（空轮/高风险被拒场景不留孤儿会话）。
+      let ensLine = '';
+      try {
+        const peek = loadQueue(qp).find((t) => t && t.status === 'queued') ?? null;
+        if (peek && !isApproveBlocked(startRun, peek)) {
+          ensLine = (await ensureDevSession(startRun, name)).line;
+        }
+      } catch { /* 前瞻失败不挡派发 */ }
+      const r = await dispatchNext(startRun);
+      if (!r.dispatched) {
+        // 待批分流（1.6.x 修）：“无可派发”是真空轮/进行中占用的说法；
+        // 高风险等批是“等你拍板”，前缀必须分开，否则用户以为坏了。
+        const waitApprove = !r.drained && /高风险未批/.test(r.reason ?? '');
+        return `${waitApprove ? '等你拍板' : '无可派发任务'}（${r.drained ? '队列已空' : r.reason}）${nameLine}`;
+      }
+      return `已派发 ${r.dispatched.id}（wave=${r.dispatched.wave}）→ dev［状态已流转：queued→dev_doing］\n` +
+        `验证命令：\`${r.dispatched.verify_cmd}\`${ensLine}${nameLine}` +
+        wakeLine(r.wake, 'dev', r.dispatched.id);
+    }
+
     // ---------- prompt hook：tag 唤起（核心易用性） ----------
     await ctx.session.hook?.('prompt', async (event) => {
       const text = event.prompt?.text ?? '';
@@ -1749,97 +1845,7 @@ export default {
           const reply = (text) => ctx.session.prompt({ sessionID, text });
           try {
             const f = parseFlags(prompt.text ?? '');
-            if (f.queue) runtimeQueue = f.queue;
-            if (f.channel) cfg.channel = f.channel;
-            if (f.no_wake === 'true') cfg.autoWake = false;
-            if (f.wake === 'true') cfg.autoWake = true;
-            // 会话优先：并行两轮时，用当前窗口所属的轮，而不是全局 current（后者可能被另一轮抢走）。
-            const startRun = sanitizeRunId(cmdRun(f) ?? runIdForSession(cwd, sessionID) ?? currentRunId());
-            // 失败零落盘：先判队列存在（不存在直接回，不写 meta 不动 current），
-            // 再 applyExecutorFlags（含模型校验），合法才 writeCurrentRunId。
-            const qp = queueFor(startRun);
-            if (!existsSync(qp)) return reply(`swarm: 队列不存在 ${displayPath(cwd, qp)}（run=${startRun}），先让 planner 写入（#plan）。` + suggestText(cwd, startRun));
-            const execStart = await applyExecutorFlags(startRun, f);
-            if (execStart.error) return reply(`❌ /swarm-start 参数错误：${execStart.error}`);
-            // 按需模型门禁（硬拦，不靠主会话自觉）：按队列实际 stack 索要模型——
-            // 只含 backend 的轮不要 dev_frontend，只含 frontend 的不要 dev_backend；
-            // 纯 legacy 轮（任务无 stack）零要求。缺啥拒收：不认领 current、不改名、不清 pendingStart、不派发。
-            let reqModels = { stacks: [], missing: [] };
-            try {
-              const allTasks = loadQueue(qp);
-              let rmsNow = {};
-              try { rmsNow = (readMeta(cwd, startRun) ?? {}).roleModels ?? {}; } catch { rmsNow = {}; }
-              reqModels = requiredModels(allTasks, rmsNow);
-            } catch { reqModels = { stacks: [], missing: [] }; }
-            if (reqModels.missing.length) {
-              const flags = reqModels.missing.map((m) => m.flag).join(' ');
-              return reply(
-                '❌ /swarm-start 模型未配齐（run=' + startRun + '，本轮 stack：' + (reqModels.stacks.join('/') || '-') + '）——门禁硬拦，未派发、未清 pendingStart。\n' +
-                reqModels.missing.map((m) => '- ' + m.key + '：' + m.reason).join('\n') + '\n' +
-                '补齐后重跑：`/swarm-start --run ' + startRun + ' ' + flags + ' <provider/model>…`（legacy --dev-model 可通配前后端；模型名查 `/swarm-models --search <关键词>`）。',
-              );
-            }
-            // #2 空轮先建议：queue 为空且有同名显示名的非空候选 → 直接回指引，
-            // 不认领 current、不改名、不清 pendingStart（零落盘；无候选走老路）。
-            try {
-              if (loadQueue(qp).length === 0) {
-                const sug = suggestText(cwd, startRun);
-                if (sug) return reply(`无可派发任务（队列已空，run=${startRun}）` + sug);
-              }
-            } catch { /* 读失败走老路 */ }
-            if (cmdRun(f)) writeCurrentRunId(cwd, startRun); // 显式 --run 即认领该轮（队列存在 + 执行器合法才认领）
-
-            // 命名：--name 优先；否则沿用 #plan 时落盘的需求名。
-            // 用户明确要的行为：「给定需求后，通过 start 应该把当前会话改成需求的名字」。
-            const pending = oneLine(f.name ?? f.title ?? '', 60);
-            const name = pending || roundNameFor(startRun);
-            if (name) {
-              const r = await nameRound(name, { currentSessionID: sessionID, run: startRun });
-              if (r.errors.length) await reply(`⚠️ 部分会话改名失败：\n${r.errors.map((x) => `- ${x}`).join('\n')}`);
-            }
-
-            // FileBus 本地通道：run 目录 + meta 确保存在即可，无外部二进制可调。
-            try { ensureRunMeta(cwd, startRun, name ? { name } : undefined); } catch { /* best-effort */ }
-            // HALT 推送目标：记录当前 sessionID（每次 start 覆盖，最新编排者为准；/swarm-up 不记）
-            try {
-              if (typeof sessionID === 'string' && sessionID.trim()) writeMeta(cwd, startRun, { notify: { requester: sessionID } });
-            } catch { /* best-effort */ }
-            const nameLine = name ? `\n本轮：**${name}**（run=${startRun}）` : '\n（本轮没有需求名：用 `/swarm-up --name 需求名` 或 `#plan <需求>` 可以让三个会话按需求命名）';
-            // P1：start 即授权派发 —— 清 pendingStart，此后 dev/test 认领才放行。
-            try { writeMeta(cwd, startRun, { startedAt: new Date().toISOString(), pendingStart: false }); } catch { /* best-effort */ }
-            bindSession(startRun, sessionID, 'host');
-            // dev 空转修复（11-05）：已有 dev_doing 不再派新单（保 wave 串行、防重复派发），
-            // 而是确保 dev 常驻会话存在并重发唤醒 —— 修“派发了没人动”的悬空。
-            let devLive = null;
-            try { devLive = loadQueue(qp).find((t) => t && t.status === 'dev_doing') ?? null; } catch { devLive = null; }
-            if (devLive) {
-              const ens = await ensureDevSession(startRun, name);
-              const wake = await wakeRole('dev', devLive, startRun);
-              return reply(
-                `已有进行中任务 ${devLive.id}（dev_doing，assignee=${devLive.assignee ?? '-'}），不重复派发${ens.line}${nameLine}` +
-                wakeLine(wake, 'dev', devLive.id),
-              );
-            }
-            // 派发前瞻：只有真会派下去才建会话（空轮/高风险被拒场景不留孤儿会话）。
-            let ensLine = '';
-            try {
-              const peek = loadQueue(qp).find((t) => t && t.status === 'queued') ?? null;
-              if (peek && !isApproveBlocked(startRun, peek)) {
-                ensLine = (await ensureDevSession(startRun, name)).line;
-              }
-            } catch { /* 前瞻失败不挡派发 */ }
-            const r = await dispatchNext(startRun);
-            if (!r.dispatched) {
-              // 待批分流（1.6.x 修）：“无可派发”是真空轮/进行中占用的说法；
-              // 高风险等批是“等你拍板”，前缀必须分开，否则用户以为坏了。
-              const waitApprove = !r.drained && /高风险未批/.test(r.reason ?? '');
-              return reply(`${waitApprove ? '等你拍板' : '无可派发任务'}（${r.drained ? '队列已空' : r.reason}）${nameLine}`);
-            }
-            return reply(
-              `已派发 ${r.dispatched.id}（wave=${r.dispatched.wave}）→ dev［状态已流转：queued→dev_doing］\n` +
-              `验证命令：\`${r.dispatched.verify_cmd}\`${ensLine}${nameLine}` +
-              wakeLine(r.wake, 'dev', r.dispatched.id),
-            );
+            return await reply(await doStart(f, sessionID, reply));
           } catch (e) {
             return reply(`❌ /swarm-start 异常：${oneLine(e?.message ?? e, 200)}`);
           }
@@ -2595,6 +2601,39 @@ export default {
             prdLine = `\nPRD：${prd}`;
           }
           return { content: (results.join('\n') || '(no tasks)') + nameLine + hintLine + prdLine };
+        },
+      });
+
+      editor.add({
+        name: 'swarm_start',
+        description: '派发本轮 queued 任务（与 /swarm-start 同源：队列前置→按需模型硬门禁→命名→pendingStart→派发/唤醒；模型问齐后直接调，不用用户跑命令）',
+        input: {
+          type: 'object',
+          properties: {
+            run: { type: 'string' }, name: { type: 'string' },
+            dev_model: { type: 'string' }, dev_backend_model: { type: 'string' }, dev_frontend_model: { type: 'string' },
+            tester_model: { type: 'string' }, reviewer_model: { type: 'string' },
+            executor: { type: 'string' }, wake: { type: 'boolean' }, no_wake: { type: 'boolean' }, ...S,
+          },
+          additionalProperties: false,
+        },
+        execute: async (input, toolCtx) => {
+          const sid = sessionOf(toolCtx, input);
+          // 结构化 input → 命令 flags 同键名（applyExecutorFlags/cmdRun 按字符串口径消费）。
+          const f = {};
+          for (const k of ['run', 'name', 'executor', 'queue', 'channel', 'dev_model', 'dev_backend_model', 'dev_frontend_model', 'tester_model', 'reviewer_model']) {
+            const v = input?.[k];
+            if (typeof v === 'string' && v.trim()) f[k] = v.trim();
+          }
+          if (input?.wake === true) f.wake = 'true';
+          if (input?.no_wake === true) f.no_wake = 'true';
+          const notes = [];
+          try {
+            const out = await doStart(f, sid, async (t) => { notes.push(String(t)); });
+            return { content: [...notes, String(out)].join('\n') };
+          } catch (e) {
+            return { content: [...notes, `❌ /swarm-start 异常：${oneLine(e?.message ?? e, 200)}`].join('\n') };
+          }
         },
       });
 

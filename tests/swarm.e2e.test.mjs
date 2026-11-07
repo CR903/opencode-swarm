@@ -102,11 +102,11 @@ before(async () => {
 after(() => { rmSync(dir, { recursive: true, force: true }); });
 
 describe('插件注册面', () => {
-  test('19 个命令 + 11 个工具全部注册（N1 新增 swarm_review；drained 新增只读 swarm-drained；clean 新增归档 swarm-clean；orchestrate 新增 swarm_halt/swarm_revert/swarm_config；eval 新增只读 swarm-eval；approve 新增 swarm_approve；npm 包新增 swarm-init；冻结线新增 swarm-freeze/swarm-unfreeze）', () => {
+  test('19 个命令 + 12 个工具全部注册（N1 新增 swarm_review；drained 新增只读 swarm-drained；clean 新增归档 swarm-clean；orchestrate 新增 swarm_halt/swarm_revert/swarm_config；eval 新增只读 swarm-eval；approve 新增 swarm_approve；npm 包新增 swarm-init；冻结线新增 swarm-freeze/swarm-unfreeze；一条龙新增 swarm_start 工具（与 /swarm-start 同源））', () => {
     assert.deepEqual([...cmds.keys()].sort(),
       ['swarm-clean', 'swarm-drained', 'swarm-eval', 'swarm-freeze', 'swarm-halt', 'swarm-init', 'swarm-migrate', 'swarm-mode', 'swarm-models', 'swarm-nightly', 'swarm-rebuild', 'swarm-retry', 'swarm-revert', 'swarm-runs', 'swarm-start', 'swarm-status', 'swarm-switch', 'swarm-unfreeze', 'swarm-up']);
     assert.deepEqual([...tools.keys()].sort(),
-      ['swarm_approve', 'swarm_claim', 'swarm_config', 'swarm_done', 'swarm_halt', 'swarm_next', 'swarm_plan', 'swarm_read_queue', 'swarm_revert', 'swarm_review', 'swarm_test']);
+      ['swarm_approve', 'swarm_claim', 'swarm_config', 'swarm_done', 'swarm_halt', 'swarm_next', 'swarm_plan', 'swarm_read_queue', 'swarm_revert', 'swarm_review', 'swarm_start', 'swarm_test']);
   });
 
   test('prompt hook 已注册（tag 唤起的前提）', () => {
@@ -4743,5 +4743,95 @@ describe('entry 派活双轨（P1-A：正文走 entry，唤醒走轻 prompt）',
     assert.match(done, /门禁通过/);
     const rm = entryRemoves.find((r) => r.key === 'swarm-task-EN3-T1');
     assert.ok(rm, 'done 通过后 remove task entry');
+  });
+});
+
+describe('swarm_start 工具（一条龙：与 /swarm-start 同源，agent 问完即调）', () => {
+  const M1 = 'opencode-go/deepseek-v4.1-flash';
+  const M2 = 'opencode-go/muse-spark-1.3-contributor';
+  let dirS;
+  let runS;
+  let promptsS;
+  const qFile = (run) => join(dirS, '.swarm/runs', run, 'queue.jsonl');
+  const mFile = (run) => join(dirS, '.swarm/runs', run, 'meta.json');
+  const qRows = (run) => JSON.parse(`[${readFileSync(qFile(run), 'utf8').split('\n').filter(Boolean).join(',')}]`);
+  const mkTask = (id) => ({
+    id, wave: 'W1', stack: 'backend', title: `两栖活${id}`,
+    acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false,
+  });
+
+  before(async () => {
+    dirS = mkdtempSync(join(tmpdir(), 'swarm-starttool-'));
+    writeFileSync(join(dirS, 'ok.mjs'), 'process.exit(0);\n');
+    execFileSync('git', ['init', '-q'], { cwd: dirS });
+    execFileSync('git', ['add', '-A'], { cwd: dirS });
+    execFileSync('git', ['commit', '-qm', 'init'], { cwd: dirS });
+    promptsS = [];
+    const toolsS = new Map();
+    const cmdsS = new Map();
+    const sessionsS = new Map();
+    let seqS = 0;
+    const ctxS = {
+      location: { directory: dirS },
+      options: { channel: 'swarm-starttool-e2e', maxRetries: 3, verifyTimeoutMs: 20_000 },
+      model: {
+        list: async () => [
+          { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek', variants: [{ id: 'low' }, { id: 'high' }, { id: 'max' }] },
+          { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark', variants: [{ id: 'minimal' }, { id: 'low' }, { id: 'medium' }, { id: 'high' }, { id: 'xhigh' }] },
+        ],
+      },
+      session: {
+        prompt: async ({ sessionID, text }) => { promptsS.push(`[${sessionID}] ${text}`); },
+        create: async ({ title, agent, model }) => {
+          const id = `st-${++seqS}`;
+          sessionsS.set(id, { id, title, agent, model });
+          return { id, title };
+        },
+        get: async ({ sessionID }) => sessionsS.get(sessionID) ?? null,
+        update: async () => {},
+        switchModel: async () => {},
+        hook: async () => {},
+      },
+      command: { transform: async (fn) => fn({ add: (d) => cmdsS.set(d.name, d) }) },
+      tool: { transform: async (fn) => fn({ add: (d) => toolsS.set(d.name, d) }) },
+    };
+    await plugin.setup(ctxS);
+    runS = async (name, input, toolCtx) => (await toolsS.get(name).execute(input, toolCtx)).content;
+  });
+
+  after(() => { rmSync(dirS, { recursive: true, force: true }); });
+
+  test('工具派发：结构化入参同命令结果（已派发 + dev_doing + 唤醒）', async () => {
+    const p = await runS('swarm_plan', { run: 'STOOL', tasks: [mkTask('ST-T1')] });
+    assert.match(p, /ST-T1: queued/);
+    const out = await runS('swarm_start', { run: 'STOOL', dev_backend_model: M1, tester_model: M2 }, { sessionID: 'host-s' });
+    assert.match(out, /已派发 ST-T1/);
+    assert.match(out, /→ dev［状态已流转：queued→dev_doing］/);
+    assert.match(out, /验证命令：`node ok\.mjs`/);
+    assert.match(out, /唤醒投递结果/);
+    assert.equal(qRows('STOOL')[0].status, 'dev_doing');
+    assert.ok(promptsS.some((t) => t.startsWith('[st-') && t.includes('## 角色：dev')), 'wake prompt 发到 dev 会话');
+  });
+
+  test('工具缺模型硬拦：状态不动、未派发（与命令同口径）', async () => {
+    await runS('swarm_plan', { run: 'STOOL2', tasks: [mkTask('ST2-T1')] });
+    const out = await runS('swarm_start', { run: 'STOOL2', dev_backend_model: M1 }, { sessionID: 'host-s' });
+    assert.match(out, /模型未配齐/);
+    assert.match(out, /未派发/);
+    assert.equal(qRows('STOOL2')[0].status, 'queued', '硬拦不得改状态');
+    assert.doesNotMatch(out, /已派发/);
+  });
+
+  test('工具缺队列零落盘（与命令同口径）', async () => {
+    const out = await runS('swarm_start', { run: 'STNOPE' }, { sessionID: 'host-s' });
+    assert.match(out, /队列不存在/);
+    assert.match(out, /STNOPE/);
+    assert.equal(existsSync(mFile('STNOPE')), false, '失败 start 不写 meta');
+  });
+
+  test('工具认 #xhigh（registry 五档实证锁死，防“四档印象”误拦）', async () => {
+    await runS('swarm_plan', { run: 'STOOL3', tasks: [mkTask('ST3-T1')] });
+    const out = await runS('swarm_start', { run: 'STOOL3', dev_backend_model: `${M1}#high`, tester_model: `${M2}#xhigh` }, { sessionID: 'host-s' });
+    assert.match(out, /已派发 ST3-T1/, '#xhigh 不得被强度门禁拒收');
   });
 });
