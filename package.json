@@ -1,6 +1,6 @@
 {
   "name": "@cr903/opencode-swarm",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Swarm multi-session orchestration for OpenCode: planner splits tasks, dev implements, tester verifies independently, reviewer audits semantics. Atomic queue, sandboxed verify gates, timeline audit, TUI board.",
   "type": "module",
   "exports": {

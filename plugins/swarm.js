@@ -756,15 +756,35 @@ export default {
           return expandTag({ role, taskId: t.id, rest: '', raw: '' }, t);
         }
       };
+      // P1-A entry 双轨（正文走 entry，唤醒走轻 prompt）：正文先进 entry
+      // （cache 友好、survive compaction）；首条照发全文（零变），2nd+ 且 entry
+      // 成功 → 轻 prompt（指针 + 契约引用行，不复贴任务块）；entry 不可用
+      // （API 缺失/抛错）→ 老路 fail-open。key 任务级，done 通过时清。
+      // 注：必须在 wakeText 定义之后（const TDZ，否则 ReferenceError 被 fail-open 吞掉）。
+      const entryKey = `swarm-task-${task.id}`;
+      let entryOk = false;
+      try {
+        const put = ctx.session.instructions?.entry?.put;
+        if (typeof put === 'function') {
+          await put({ sessionID: sid, key: entryKey, value: wakeText(task) });
+          entryOk = true;
+        }
+      } catch { entryOk = false; }
+      const lightText = (t) => [
+        `## 角色：${role}`,
+        `你是 ${role}：按本会话已注入的 ${role} 契约执行（完整版见本轮首条唤醒，不重复贴）。`,
+        '',
+        `任务 ${t.id} 正文见本会话 instructions[${entryKey}]（已同步，不复贴）：按 entry 的验收 + verify_cmd 开工。`,
+      ].join('\n');
       if (targetModel) {
         let index = null;
         try { index = await modelIndex(ctx); } catch { index = null; }
         if (!index) {
-          const text = wakeText(task);
+          const text = (!compact || !entryOk) ? wakeText(task) : lightText(task);
           try {
             await ctx.session.prompt({ sessionID: sid, text });
             markWoken();
-            return { sessionID: sid, unverified: true };
+            return { sessionID: sid, unverified: true, ...(entryOk ? { entry: entryKey } : {}) };
           } catch (e) {
             return { error: `${sid}: ${oneLine(e?.message ?? e, 120)}` };
           }
@@ -775,11 +795,11 @@ export default {
           return { blocked: `${role} 会话 ${sid} 模型不可用：${r.reason}${hint}；查可用模型：\`/swarm-models --search <关键词>\`（或 \`opencode api get /api/model\`），修模型后重建会话` };
         }
       }
-      const text = wakeText(task);
+      const text = (!compact || !entryOk) ? wakeText(task) : lightText(task);
       try {
         await ctx.session.prompt({ sessionID: sid, text });
         markWoken();
-        return { sessionID: sid };
+        return { sessionID: sid, ...(entryOk ? { entry: entryKey } : {}) };
       } catch (e) {
         return { error: `${sid}: ${oneLine(e?.message ?? e, 120)}` };
       }
@@ -789,7 +809,8 @@ export default {
       if (!res) return '';
       if (res.sessionID) {
         const unverified = res.unverified ? '（未预检：注册表不可用，未验证模型是否可用）' : '';
-        return `\n唤醒投递结果：指令已投递到 ${role} 会话 ${res.sessionID}${unverified}（未验证跑起来，去 ${role} 会话确认是否开工：\`#${role} ${taskId}\`）`;
+        const entry = res.entry ? `（正文已进 instructions[${res.entry}]，唤醒只带指针）` : '';
+        return `\n唤醒投递结果：指令已投递到 ${role} 会话 ${res.sessionID}${unverified}${entry}（未验证跑起来，去 ${role} 会话确认是否开工：\`#${role} ${taskId}\`）`;
       }
       if (res.blocked) return `\n⚠️ 唤醒未投递：${res.blocked}（未发指令，手动在该会话修好后发 \`#${role} ${taskId}\`）`;
       if (res.error) return `\n⚠️ 唤醒失败：${res.error}（请手动在该会话里发 \`#${role} ${taskId}\`）`;
@@ -2760,6 +2781,15 @@ export default {
             summary: input.summary,
           }, { by: 'gate', reason: forced ? 'gate-pass:force-base' : 'gate-pass', queue: qIn });
           if (!r.ok) return { content: `状态迁移失败：${r.message}` };
+          // P1-A 卫生：task entry 随 dev 交工而清（key 任务级；best-effort，抛错不挡放行；
+          // 无 dev 会话/重建换 sid 时旧 key 残留，下次同任务唤醒 put 覆盖）。
+          try {
+            const rm = ctx.session.instructions?.entry?.remove;
+            const devSid = roleSessionsFor(runId)?.dev;
+            if (typeof rm === 'function' && devSid) {
+              await rm({ sessionID: devSid, key: `swarm-task-${task.id}` });
+            }
+          } catch { /* entry 清理失败不挡门禁通过 */ }
           await emitFor(runId, input.as ?? 'dev', '[TASK-DONE]', {
             task: task.id, commit, verdict: input.verdict_path ?? task.verdict_path ?? '-',
             suite: 'pass', ms: String(gate.evidence?.durationMs ?? '-'),

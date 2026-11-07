@@ -61,6 +61,7 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 - **并行多轮**：run 解析优先级 = 显式 `run` > 任务归属（带 task_id 时）> 会话绑定（`round.json` 的 sessions/members）> 全局 `.swarm/current`。同一会话开新轮会被自动从旧轮摘走；不同窗口并行互不抢指针。
 - dev（会话 wake 为主）prompt = 任务 JSON + 验收标准 + `verify_cmd` + 上次 fail 的 `detail/failed_ids`（时间线现成，直接复用；自然语言 bug 全程不让人碰 dev 会话，主会话代跑唤醒）。
   - **prompt 首行写 `run=<runId>`**，并让子代理在工具调用里带上 `run`；插件也会按 `task_id` 兜底反查，但显式带上更稳。
+  - **entry 双轨（1.9.0，正文走 entry，唤醒走轻 prompt）**：wake 先 `entry.put（key=swarm-task-<id>）` 存正文；首条照发全文，2nd+ 且 entry 成功发轻 prompt（指针 + 契约引用行，不复贴）；entry 不可用回退老路；`done` 通过清 key。编排侧无动作（插件内闭环），只在 dev 说"没收到正文"时知道去 instructions 里看。
 - test 子代理 prompt = 任务 JSON + `verify_cmd` + 边界要求。
 - reviewer（review=true 任务 test pass 后）prompt = 任务 JSON + `git show <commit>` diff（截断 50KB）+ REVIEW.md 命中 + `excluded=[finding ids]`。
 - 判活口径与 `/swarm-drained` 同调：queued 空 + 无 `dev_doing/test_doing/reviewing` 即结束。

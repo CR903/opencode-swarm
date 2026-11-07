@@ -4607,3 +4607,141 @@ describe('思考强度 variant（#high 透传：校验→落盘→建会话→�
     assert.match(out, /不需要加载任何 skill/);
   });
 });
+
+describe('entry 派活双轨（P1-A：正文走 entry，唤醒走轻 prompt）', () => {
+  // 独立 harness：自带 recording instructions mock；其它套件无 instructions（?. 短路走老路，零干扰）。
+  const M1 = 'opencode-go/deepseek-v4.1-flash';
+  const M2 = 'opencode-go/muse-spark-1.3-contributor';
+  const F = `--dev-backend-model ${M1} --tester-model ${M2}`;
+  let dirE;
+  let runE;
+  let cmdE;
+  let promptCallsE;
+  let entryPuts;
+  let entryRemoves;
+  let entryThrow;
+  let seqE;
+  const mkTask = (id, acceptance) => ({
+    id, wave: 'W1', stack: 'backend', title: `entry活${id}`,
+    acceptance, verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false,
+  });
+
+  before(async () => {
+    dirE = mkdtempSync(join(tmpdir(), 'swarm-entry-'));
+    writeFileSync(join(dirE, 'ok.mjs'), 'process.exit(0);\n');
+    execFileSync('git', ['init', '-q'], { cwd: dirE });
+    execFileSync('git', ['add', '-A'], { cwd: dirE });
+    execFileSync('git', ['commit', '-qm', 'init'], { cwd: dirE });
+    promptCallsE = [];
+    entryPuts = [];
+    entryRemoves = [];
+    entryThrow = false;
+    seqE = 0;
+    const toolsE = new Map();
+    const cmdsE = new Map();
+    const sessionsE = new Map();
+    const ctxE = {
+      location: { directory: dirE },
+      options: { channel: 'swarm-entry-e2e', maxRetries: 3, verifyTimeoutMs: 20_000 },
+      model: {
+        list: async () => [
+          { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek' },
+          { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark' },
+        ],
+      },
+      session: {
+        prompt: async ({ sessionID, text }) => { promptCallsE.push({ sessionID, text }); },
+        create: async ({ title }) => { const id = `e-sess-${++seqE}`; sessionsE.set(id, { id, title }); return { id, title }; },
+        get: async ({ sessionID }) => sessionsE.get(sessionID) ?? null,
+        update: async () => {},
+        switchModel: async () => {},
+        hook: async () => {},
+        instructions: {
+          entry: {
+            put: async ({ sessionID, key, value }) => {
+              entryPuts.push({ sessionID, key, value });
+              if (entryThrow) throw new Error('entry store down');
+            },
+            remove: async ({ sessionID, key }) => {
+              entryRemoves.push({ sessionID, key });
+              if (entryThrow) throw new Error('entry store down');
+            },
+          },
+        },
+      },
+      command: { transform: async (fn) => fn({ add: (d) => cmdsE.set(d.name, d) }) },
+      tool: { transform: async (fn) => fn({ add: (d) => toolsE.set(d.name, d) }) },
+    };
+    await plugin.setup(ctxE);
+    runE = async (name, input) => (await toolsE.get(name).execute(input)).content;
+    cmdE = async (name, text = '', sessionID = 's1-entry') => {
+      await cmdsE.get(name).execute({ sessionID, prompt: { text } });
+    };
+  });
+
+  after(() => { rmSync(dirE, { recursive: true, force: true }); });
+
+  // 命令回执同样走 session.prompt（reply to s1-entry）：wake 断言只看 dev 会话行。
+  const wakes = () => promptCallsE.filter((p) => String(p.sessionID).startsWith('e-sess-'));
+
+  test('首条照发全文 + entry 落盘（零变 + 新增）', async () => {
+    await cmdE('swarm-up', '--run ENTRY1 --name 条目演练');
+    await runE('swarm_plan', { run: 'ENTRY1', tasks: [mkTask('EN-T1', 'EN验收：exit0-aaa')] });
+    await cmdE('swarm-start', `--run ENTRY1 ${F}`);
+    assert.equal(wakes().length, 1, '首条 wake 投递一次 prompt');
+    const first = wakes()[0].text;
+    assert.match(first, /## 角色：dev/, '首条是全文（含契约）');
+    assert.match(first, /EN验收：exit0-aaa/, '首条含任务验收（零变）');
+    const put = entryPuts.find((p) => p.key === 'swarm-task-EN-T1');
+    assert.ok(put, 'entry 落盘 key=swarm-task-<id>');
+    assert.match(put.value, /node ok\.mjs/, 'entry 正文含 verify_cmd');
+  });
+
+  test('二次唤醒走轻 prompt（指针 + 不复贴）', async () => {
+    const done = await runE('swarm_done', { run: 'ENTRY1', task_id: 'EN-T1', summary: '初版' });
+    assert.match(done, /门禁通过/);
+    const out = await runE('swarm_test', { run: 'ENTRY1', task_id: 'EN-T1', pass: false, failed_ids: 'B1', detail: '挂了', disposition: 'fixed' });
+    assert.match(out, /回 dev/);
+    assert.equal(wakes().length, 2, '回 dev 再唤醒一次');
+    const second = wakes()[1].text;
+    assert.match(second, /instructions\[swarm-task-EN-T1\]/, '轻 prompt 带 entry 指针');
+    assert.match(second, /不复贴/, '轻 prompt 声明不复贴');
+    assert.doesNotMatch(second, /EN验收：exit0-aaa/, '轻 prompt 不贴任务验收');
+    assert.equal(entryPuts.filter((p) => p.key === 'swarm-task-EN-T1').length, 2, '重派覆盖同 key');
+    assert.match(out, /instructions\[swarm-task-EN-T1\]/, 'wakeLine 注明正文已进 entry');
+  });
+
+  test('entry 挂了回退老路（fail-open：照投递、不崩）', async () => {
+    entryThrow = true;
+    try {
+      await cmdE('swarm-up', '--run ENTRY2 --name 回退演练');
+      await runE('swarm_plan', { run: 'ENTRY2', tasks: [mkTask('EN2-T1', 'EN2验收：exit0-bbb')] });
+      await cmdE('swarm-start', `--run ENTRY2 ${F}`);
+      const n0 = wakes().length;
+      const d = await runE('swarm_done', { run: 'ENTRY2', task_id: 'EN2-T1', summary: '初版' });
+      assert.match(d, /门禁通过/);
+      const out = await runE('swarm_test', { run: 'ENTRY2', task_id: 'EN2-T1', pass: false, failed_ids: 'B1', detail: '又挂了', disposition: 'fixed' });
+      assert.match(out, /回 dev/);
+      assert.equal(wakes().length, n0 + 1, '回退：照样唤醒');
+      const second = wakes().at(-1).text;
+      assert.match(second, /EN2验收：exit0-bbb/, '回退：二次唤醒是老 compact 全文');
+      assert.doesNotMatch(second, /不复贴/, '回退：无轻 prompt 标记');
+      assert.match(out, /唤醒投递结果/, '回退：唤醒照投递（不是唤醒失败）');
+      // done 照过（remove 抛错不挡门禁）
+      const done = await runE('swarm_done', { run: 'ENTRY2', task_id: 'EN2-T1', summary: '修好' });
+      assert.match(done, /门禁通过/);
+    } finally {
+      entryThrow = false;
+    }
+  });
+
+  test('done 通过清 task entry（卫生，抛错也不挡）', async () => {
+    await cmdE('swarm-up', '--run ENTRY3 --name 清理演练');
+    await runE('swarm_plan', { run: 'ENTRY3', tasks: [mkTask('EN3-T1', 'EN3验收：exit0-ccc')] });
+    await cmdE('swarm-start', `--run ENTRY3 ${F}`);
+    const done = await runE('swarm_done', { run: 'ENTRY3', task_id: 'EN3-T1', summary: '做完' });
+    assert.match(done, /门禁通过/);
+    const rm = entryRemoves.find((r) => r.key === 'swarm-task-EN3-T1');
+    assert.ok(rm, 'done 通过后 remove task entry');
+  });
+});
