@@ -103,6 +103,10 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 异常升级：HALT 已有推送（requester 会收到"⛔ HALT 通知 … 恢复：/swarm-retry --task X"），
 收到即停轮询、原话转述给用户，等拍板；高风险任务（`risk=high` 或命中 `sensitivePaths`）
 把"⚠️ 高风险：建议两人复核"原文转述，不自己放行。
+test 待派推送（opt-in，默认不吵）：`swarm_start --test-push`（命令 `/swarm-start --test-push` 同效，
+`--no-test-push` 关，按轮落 meta）后，每单 dev→test 且 test 无会话可唤醒时 requester 会收到
+"🔔 待派 test …（model=/swarm-mode recipe）"——收到即按 recipe 派 test 子代理，不要等用户开口。
+没开时中间态零推送（只有 HALT 和全绿推），主会话收工即静默卡单，属预期行为。
 
 ## 6. token-economy（只指导编排侧的用词与读法，不碰任何门禁与流程）
 

@@ -4835,3 +4835,109 @@ describe('swarm_start 工具（一条龙：与 /swarm-start 同源，agent 问�
     assert.match(out, /已派发 ST3-T1/, '#xhigh 不得被强度门禁拒收');
   });
 });
+
+describe('test 待派推送（opt-in：默认不吵，开了才推 requester）', () => {
+  const M1 = 'opencode-go/deepseek-v4.1-flash';
+  const M2 = 'opencode-go/muse-spark-1.3-contributor';
+  const F = `--dev-backend-model ${M1} --tester-model ${M2}`;
+  let dirP;
+  let runP;
+  let cmdP;
+  let promptsP;
+  const qRows = (run) => JSON.parse(`[${readFileSync(join(dirP, '.swarm/runs', run, 'queue.jsonl'), 'utf8').split('\n').filter(Boolean).join(',')}]`);
+  const mOf = (run) => JSON.parse(readFileSync(join(dirP, '.swarm/runs', run, 'meta.json'), 'utf8'));
+  const mkTask = (id) => ({
+    id, wave: 'W1', stack: 'backend', title: `推送活${id}`,
+    acceptance: 'ok', verify_cmd: 'node ok.mjs', testing: '同 verify_cmd', review: false,
+  });
+  // requester 行：start 命令会话即 requester（s1-push），dev wake 行是 ep-sess- 前缀。
+  const toRequester = () => promptsP.filter((t) => t.startsWith('[s1-push]'));
+
+  before(async () => {
+    dirP = mkdtempSync(join(tmpdir(), 'swarm-testpush-'));
+    writeFileSync(join(dirP, 'ok.mjs'), 'process.exit(0);\n');
+    execFileSync('git', ['init', '-q'], { cwd: dirP });
+    execFileSync('git', ['add', '-A'], { cwd: dirP });
+    execFileSync('git', ['commit', '-qm', 'init'], { cwd: dirP });
+    promptsP = [];
+    const toolsP = new Map();
+    const cmdsP = new Map();
+    const sessionsP = new Map();
+    let seqP = 0;
+    const ctxP = {
+      location: { directory: dirP },
+      options: { channel: 'swarm-testpush-e2e', maxRetries: 3, verifyTimeoutMs: 20_000 },
+      model: {
+        list: async () => [
+          { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek' },
+          { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', name: 'Muse Spark' },
+        ],
+      },
+      session: {
+        prompt: async ({ sessionID, text }) => { promptsP.push(`[${sessionID}] ${text}`); },
+        create: async ({ title }) => { const id = `ep-sess-${++seqP}`; sessionsP.set(id, { id, title }); return { id, title }; },
+        get: async ({ sessionID }) => sessionsP.get(sessionID) ?? null,
+        update: async () => {},
+        switchModel: async () => {},
+        hook: async () => {},
+      },
+      command: { transform: async (fn) => fn({ add: (d) => cmdsP.set(d.name, d) }) },
+      tool: { transform: async (fn) => fn({ add: (d) => toolsP.set(d.name, d) }) },
+    };
+    await plugin.setup(ctxP);
+    runP = async (name, input) => (await toolsP.get(name).execute(input)).content;
+    cmdP = async (name, text = '') => {
+      await cmdsP.get(name).execute({ sessionID: 's1-push', prompt: { text } });
+    };
+  });
+
+  after(() => { rmSync(dirP, { recursive: true, force: true }); });
+
+  test('默认关：done 过门禁只唤醒 dev 系，不推 requester', async () => {
+    await cmdP('swarm-up', '--run PUSH0 --name 静默演练');
+    await runP('swarm_plan', { run: 'PUSH0', tasks: [mkTask('TP-T0')] });
+    await cmdP('swarm-start', `--run PUSH0 ${F}`);
+    const n0 = toRequester().length;
+    const done = await runP('swarm_done', { run: 'PUSH0', task_id: 'TP-T0', summary: '做完' });
+    assert.match(done, /门禁通过/);
+    assert.equal(qRows('PUSH0')[0].status, 'test_doing');
+    assert.equal(toRequester().length, n0, '默认不推：requester 零新增');
+    assert.equal(mOf('PUSH0').testPush ?? null, null, '默认不落 testPush（保持安静且干净）');
+  });
+
+  test('--test-push 开：done 过门禁推 requester（含任务+test 模型）', async () => {
+    await cmdP('swarm-up', '--run PUSH1 --name 推送演练');
+    await runP('swarm_plan', { run: 'PUSH1', tasks: [mkTask('TP-T1')] });
+    await cmdP('swarm-start', `--run PUSH1 ${F} --test-push`);
+    assert.equal(mOf('PUSH1').testPush, true, '--test-push 落 meta（按轮持久）');
+    const n0 = toRequester().length;
+    const done = await runP('swarm_done', { run: 'PUSH1', task_id: 'TP-T1', summary: '做完' });
+    assert.match(done, /门禁通过/);
+    assert.equal(toRequester().length, n0 + 1, '开后推一次');
+    const push = toRequester().at(-1);
+    assert.match(push, /TP-T1/, 'push 点名任务');
+    assert.match(push, new RegExp(M2.replace(/\//g, '\\/')), 'push 带 test 模型（编排照抄即派）');
+  });
+
+  test('工具 test_push:true 同效（一条龙也进 meta）', async () => {
+    await runP('swarm_plan', { run: 'PUSH2', tasks: [mkTask('TP-T2')] });
+    await runP('swarm_start', { run: 'PUSH2', dev_backend_model: M1, tester_model: M2, test_push: true });
+    assert.equal(mOf('PUSH2').testPush, true, '工具 flag 同效');
+    const n0 = toRequester().length;
+    await runP('swarm_done', { run: 'PUSH2', task_id: 'TP-T2', summary: '做完' });
+    assert.equal(toRequester().length, n0, '工具起的轮 requester 缺席则零动作（不崩）');
+  });
+
+  test('--no-test-push 可关：先开后关，done 不推', async () => {
+    await cmdP('swarm-up', '--run PUSH3 --name 开关演练');
+    await runP('swarm_plan', { run: 'PUSH3', tasks: [mkTask('TP-T3')] });
+    await cmdP('swarm-start', `--run PUSH3 ${F} --test-push`);
+    assert.equal(mOf('PUSH3').testPush, true);
+    await cmdP('swarm-start', '--run PUSH3 --no-test-push');
+    assert.equal(mOf('PUSH3').testPush, false, '--no-test-push 写 false（非删除，语义明确）');
+    const n0 = toRequester().length;
+    const done = await runP('swarm_done', { run: 'PUSH3', task_id: 'TP-T3', summary: '做完' });
+    assert.match(done, /门禁通过/);
+    assert.equal(toRequester().length, n0, '关后不推');
+  });
+});

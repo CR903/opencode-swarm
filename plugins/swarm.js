@@ -61,6 +61,7 @@ const DEFAULTS = {
   sweepMs: 60_000,
   allowlist: [],
   autoWake: true,
+  testPush: false,
   policyDeny: [],
   sensitivePaths: [],
   gates: {},
@@ -85,6 +86,7 @@ function settings(ctx) {
     sweepMs: o.sweepMs ?? DEFAULTS.sweepMs,
     allowlist: [...DEFAULT_ALLOWLIST, ...(asStringArray(o.allowlist))],
     autoWake: o.autoWake ?? DEFAULTS.autoWake,
+    testPush: o.testPush ?? DEFAULTS.testPush,
     policyDeny: asStringArray(o.policyDeny ?? DEFAULTS.policyDeny),
     sensitivePaths: asStringArray(o.sensitivePaths ?? DEFAULTS.sensitivePaths),
     gates: (o.gates && typeof o.gates === 'object') ? o.gates : {},
@@ -1254,6 +1256,12 @@ export default {
           if (sug) return `无可派发任务（队列已空，run=${startRun}）` + sug;
         }
       } catch { /* 读失败走老路 */ }
+      // test 待派推送开关（opt-in，默认不吵）：门禁全过才落 meta（失败零落盘），
+      // 按轮持久（各轮独立，不进 cfg 全局）。重跑 start 改开关不重复派发（后文 dev_doing 短路照常）。
+      try {
+        if (f.test_push === 'true') writeMeta(cwd, startRun, { testPush: true });
+        else if (f.no_test_push === 'true') writeMeta(cwd, startRun, { testPush: false });
+      } catch { /* 开关落盘失败不挡派发 */ }
       if (cmdRun(f)) writeCurrentRunId(cwd, startRun); // 显式 --run 即认领该轮（队列存在 + 执行器合法才认领）
 
       // 命名：--name 优先；否则沿用 #plan 时落盘的需求名。
@@ -2613,7 +2621,7 @@ export default {
             run: { type: 'string' }, name: { type: 'string' },
             dev_model: { type: 'string' }, dev_backend_model: { type: 'string' }, dev_frontend_model: { type: 'string' },
             tester_model: { type: 'string' }, reviewer_model: { type: 'string' },
-            executor: { type: 'string' }, wake: { type: 'boolean' }, no_wake: { type: 'boolean' }, ...S,
+            executor: { type: 'string' }, wake: { type: 'boolean' }, no_wake: { type: 'boolean' }, test_push: { type: 'boolean' }, no_test_push: { type: 'boolean' }, ...S,
           },
           additionalProperties: false,
         },
@@ -2627,6 +2635,8 @@ export default {
           }
           if (input?.wake === true) f.wake = 'true';
           if (input?.no_wake === true) f.no_wake = 'true';
+          if (input?.test_push === true) f.test_push = 'true';
+          if (input?.no_test_push === true) f.no_test_push = 'true';
           const notes = [];
           try {
             const out = await doStart(f, sid, async (t) => { notes.push(String(t)); });
@@ -2834,6 +2844,22 @@ export default {
             suite: 'pass', ms: String(gate.evidence?.durationMs ?? '-'),
           });
           const wake = await wakeRole('test', r.task, runId);
+          // test 待派推送（opt-in，默认不吵）：只在 test 无会话可唤醒（subagent 模式，
+          // wake skipped）且开关开时推 requester 一次。开关：meta.testPush（按轮，
+          // /swarm-start --test-push/--no-test-push）?? cfg.testPush（全局默认 false）。
+          // 复用 notifyHalt 通道（同 requester、失败静默、不挡放行）。
+          try {
+            let tp = null;
+            try { tp = (readMeta(cwd, runId) ?? {}).testPush; } catch { tp = null; }
+            const on = tp === true || (tp !== false && (cfg.testPush ?? false) === true);
+            if (on && wake && wake.skipped) {
+              let testModel = '-';
+              try { testModel = (readMeta(cwd, runId) ?? {}).roleModels?.test ?? '-'; } catch { testModel = '-'; }
+              await notifyHalt(runId,
+                `🔔 待派 test：${task.id}（wave=${task.wave ?? '-'}）门禁过→test_doing，无 test 会话可唤醒。` +
+                `请按 /swarm-mode recipe 派 test 子代理（model=${testModel}，verify=${task.verify_cmd ?? '-'}）。`);
+            }
+          } catch { /* 推送失败静默，不挡门禁通过 */ }
           const execWarns = Array.isArray(gate.evidence?.warnings) ? gate.evidence.warnings : [];
           const warnNote = execWarns.length ? `\n⚠️ verify warn（本次放行）：${execWarns.join('; ')}` : '';
           return { content: `run=${runId} · ✅ 门禁通过（${gate.evidence?.durationMs ?? '?'}ms）：状态已流转 gate_check→test_doing（已交 test）\ncommit=${commit}${warnNote}${baseWarn}` + wakeLine(wake, 'test', task.id) };
