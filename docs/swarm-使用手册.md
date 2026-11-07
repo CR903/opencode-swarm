@@ -595,7 +595,9 @@ swarm_* tool，不写队列/timeline，动作指回命令（板上文案只写�
 - **跟随逻辑（登记者可见）**：sidebar/footer 只认“调过动作命令的会话”（plan/claim/done/test/review/approve/start 等写 `round.json → members`；只读命令不登记）。**重启服务后 sid 会变**：旧登记留在老 sid 上，当前会话未跑过命令前看板保持隐藏、高亮缺席——这不是 bug，在本会话跑任意动作命令即重新登记。`/swarm-status` 的 `### 本会话` 行会明说当前 sid 登没登记（已登记给 run，未登记说隐藏）。
 - **按键**（仅 board 页内生效，板外按键放行）：`j/k` 移动，`Enter` 跳会话
   （会话行→`tabs.focus`，不在则建；任务行→其 assignee 会话；tab 禁用时回退到路由导航），
-  `Backspace` 回进入前会话（无记录则回 home），`1/2/3` 切会话/任务/明细区，`w` 循环切波次，`?` 弹按键帮助。
+  `Backspace` 回进入前会话（无记录则回 home），`1/2/3` 切会话/任务/明细区，`w` 循环切波次（偏好进 durable storage，重启不丢），`n` 开关待批通知，`?` 弹按键帮助。
+- **transcript 内嵌**：```swarm 围栏（正文 `run: <id>`，缺省当前轮）被渲染成 funnel 摘要 + 待批行（`ctx.markdown.registerCodeBlockRenderer`，纯读；构造失败回默认代码渲染）。
+- **边缘通知**：HALT 默认报、待批 opt-in（`n` 切），持续态不重复，只在终端失焦时弹（`attention.notify when:blurred`），失败静默。
 - **数据**：2s 轮询 + mtime 指纹（`.swarm/runs/<run>` 下 queue/timeline/events/round/meta 最大 mtime，
   无变化不刷新）；路径以项目根为基准（`data.location.default().directory`，不用 cwd）。
 - **已知缺口**：`Enter` 跳会话与 `Backspace` 返回尚未进 TUI 真机实测（headless `node --test` 只覆盖数据层；

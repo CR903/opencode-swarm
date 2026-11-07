@@ -7,11 +7,14 @@
  * - `prompt.footer.status` 一行：`swarm <run>: D<n> G<n> ✓<n>`。
  * - 数据轮询 2s + mtime 指纹（无变化不 setSignal）；digest 截断（事件尾 8、明细 50）。
  * - T3 键盘：board 页内 j/k 移动，Enter 跳会话，Backspace 返回，1/2/3 切区，w 波次过滤，? 帮助行。
+ * - P0（1.8.0）：wave/notifyPending 进 durable storage；```swarm 围栏渲染 funnel 摘要；
+ *   HALT 默认通知 + 待批 opt-in（n 切），边缘触发、失焦才弹。
  *
  * 约束：纯读（不调任何 swarm_* tool，不写队列/timeline）；无 console.*；
  * 路径以项目根为基准（data.location.default().directory，cwd 不可靠）。
  */
 import { Plugin } from "@opencode/plugin/tui";
+import { TextRenderable } from "@opentui/core";
 import { createSignal, For } from "solid-js";
 import {
   readRunSnapshot,
@@ -25,6 +28,10 @@ import {
   formatElapsed,
   executorOf,
   pendingApprovals,
+  nextWave,
+  parseSwarmBlock,
+  formatSwarmDigest,
+  notifyEdge,
   STATUS_ROLES,
 } from "../lib/swarm-board-data.mjs";
 import { readCurrentRunId, roundsToPass } from "../lib/swarm-run.js";
@@ -153,7 +160,31 @@ export default Plugin.define({
     })();
     const [snap, setSnap] = createSignal(initialRun == null ? emptySnap() : readRunSnapshot(rootOf(), initialRun));
     const [tick, setTick] = createSignal(Date.now());
-    const [wave, setWave] = createSignal<string>("all");
+    // P0-1：board 显示偏好进 durable storage（重启/多实例同步；老宿主无 storage 回内存，行为零变）。
+    // 只存显示偏好（wave/notifyPending），队列与审计状态一律不动——纯读约束。
+    const NO_PREFS = { wave: "all", notifyPending: false };
+    let prefsGet = (): { wave: string; notifyPending: boolean } => ({ ...NO_PREFS });
+    let prefsSave: ((fn: (d: { wave: string; notifyPending: boolean }) => void) => void) | null = null;
+    try {
+      const [store, update] = ctx.storage.store("swarm-board-prefs", { initial: { ...NO_PREFS } });
+      prefsGet = () => ({
+        wave: typeof store.wave === "string" && store.wave ? store.wave : "all",
+        notifyPending: store.notifyPending === true,
+      });
+      prefsSave = (fn) => {
+        try {
+          const p = update(fn) as unknown as Promise<void> | void;
+          if (p && typeof (p as Promise<void>).catch === "function") (p as Promise<void>).catch(() => {});
+        } catch { /* 本地偏好写失败静默 */ }
+      };
+    } catch { /* 无 storage 的宿主：内存信号 */ }
+    const [wave, setWaveState] = createSignal<string>(prefsGet().wave);
+    const setWave = (w: string) => {
+      setWaveState(w);
+      try { prefsSave?.((d) => { d.wave = w; }); } catch { /* 忽略 */ }
+    };
+    // P0-3：边缘通知上轮指纹（null=首次轮询，见 notifyEdge 语义）。
+    const prevNotify: { cur: { halted: number; pending: string[] } | null } = { cur: null };
     const [cursor, setCursor] = createSignal(0);
     const [lastSession, setLastSession] = createSignal<string | null>(null);
     const [isBoard, setIsBoard] = createSignal(false);
@@ -212,6 +243,26 @@ export default Plugin.define({
       } catch {
         setIsBoard(false);
       }
+      // P0-3：HALT/待批边缘通知（默认只报 HALT；待批需偏好 opt-in；持续态不重复）。
+      // 纯读派生 + attention 系统通知，不写队列不改审计；失败静默。
+      try {
+        const fNow = funnelCounts(snap().tasks);
+        const cur = { halted: fNow.halted, pending: pendingOf() };
+        const edge = notifyEdge(prevNotify.cur, cur, { pendingEnabled: prefsGet().notifyPending });
+        prevNotify.cur = cur;
+        if (edge) {
+          try {
+            const p = ctx.attention.notify({
+              title: `Swarm ${edge.title}`,
+              message: edge.message,
+              notification: { when: "blurred" },
+            }) as unknown as Promise<unknown> | void;
+            if (p && typeof (p as Promise<unknown>).catch === "function") {
+              (p as Promise<unknown>).catch(() => {});
+            }
+          } catch { /* 通知失败不影响板 */ }
+        }
+      } catch { /* 派生失败不断轮询 */ }
     };
 
     poll();
@@ -474,19 +525,25 @@ export default Plugin.define({
             bind: "w",
             run: () => {
               if (!guard()) return false;
-              const ws = waves();
-              if (!ws.length) {
-                setWave("all");
-                return;
-              }
-              const cur = wave();
-              if (cur === "all") {
-                setWave(ws[0]);
-              } else {
-                const i = ws.indexOf(cur);
-                setWave(i < 0 || i + 1 >= ws.length ? "all" : ws[i + 1]);
-              }
+              // P0-1：循环逻辑走 lib nextWave（单测锁死），此处只 set + 持久化。
+              setWave(nextWave(wave(), waves()));
               setCursor(0);
+            },
+          },
+          {
+            id: "swarm-board.notify",
+            title: "待批通知开关",
+            group: "Swarm",
+            bind: "n",
+            run: () => {
+              if (!guard()) return false;
+              // P0-3 opt-in：只写本地显示偏好，不碰队列/审计。
+              const next = !prefsGet().notifyPending;
+              try { prefsSave?.((d) => { d.notifyPending = next; }); } catch { /* 忽略 */ }
+              ctx.ui.toast.show({
+                message: next ? "待批通知已开（HALT 本来就报）" : "待批通知已关（HALT 照报）",
+                variant: "info",
+              });
             },
           },
           {
@@ -497,7 +554,7 @@ export default Plugin.define({
             run: () => {
               if (!guard()) return false;
               ctx.ui.toast.show({
-                message: "j/k移动 ⏎跳会话 Backspace返回 1/2/3切区 w波次过滤",
+                message: "j/k移动 ⏎跳会话 Backspace返回 1/2/3切区 w波次 n待批通知 ?帮助",
                 variant: "info",
               });
             },
@@ -877,7 +934,7 @@ export default Plugin.define({
               <text fg={t.text.faint}>{`${String(e.ts ?? "").slice(11, 19)} ${String(e.by ?? "?")} ${String(e.text ?? "").slice(0, 80)}`}</text>
             )}
           </For>
-          <text fg={t.text.faint}>{"j/k移动 ⏎跳会话 Backspace返回 1/2/3切区 w波次 ?帮助（本行即帮助）"}</text>
+          <text fg={t.text.faint}>{"j/k移动 ⏎跳会话 Backspace返回 1/2/3切区 w波次 n待批通知 ?帮助（本行即帮助）"}</text>
           </box>
         </>
       );
@@ -896,12 +953,38 @@ export default Plugin.define({
       render: () => <GlobalKeys />,
     });
 
+    // P0-2：```swarm 代码块渲染器（transcript 内嵌 funnel 摘要，纯读）。
+    // token.text=围栏正文 → parseSwarmBlock 取 run（缺省当前轮）→ formatSwarmDigest 贴字串。
+    // 构造失败/无快照一律回 defaultRender（宿主另有失败隔离 #62110，不连累板）。
+    const unregisterCode = (() => {
+      try {
+        return ctx.markdown.registerCodeBlockRenderer("swarm", (token: any, rctx: any) => {
+          const fallback = () => {
+            try { return rctx?.defaultRender?.() ?? null; } catch { return null; }
+          };
+          try {
+            const code = typeof token?.text === "string" ? token.text : "";
+            const want = parseSwarmBlock(code).run;
+            const root = rootOf();
+            let runId: string | null = want;
+            if (!runId) {
+              try { runId = readCurrentRunId(root); } catch { runId = null; }
+            }
+            if (!runId) return fallback();
+            const digest = formatSwarmDigest(readRunSnapshot(root, runId));
+            return new TextRenderable(ctx.renderer as any, { content: digest });
+          } catch { return fallback(); }
+        });
+      } catch { return () => {}; }
+    })();
+
     return () => {
       clearInterval(timer);
       unregisterPage();
       unregisterCard();
       unregisterFooter();
       unregisterApp();
+      try { unregisterCode(); } catch { /* 卸载期忽略 */ }
     };
   },
 });

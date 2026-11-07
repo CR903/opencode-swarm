@@ -114,3 +114,5 @@ swarm_read_queue 看现状 → 按 §2 分类意图 →
 - **Delegation 阈值**：子代理/新会话有 ~10k 级固定地板价（新 context 从零起）。一次 grep/单文件小改主会话直做； noisy 的多文件扫描、并行探索才值得派。阈值是经验参考，不是门禁。
 - **前缀稳定**：唤醒增量机制由插件承担（首条全量、后续增量、换会话自动回全量），编排侧拼 prompt 时保持同一套措辞与顺序，利于缓存命中；不要每轮发明新话术。
 - **模型按需**：§4 默认映射（dev/test 走低强度、planner/reviewer 走高强度）已是成本最优点；质量由门禁兜底——低强度做错会被 verify/test 打回，换高强度只在"难啃单任务"上点对点加，不整轮升级。
+- **宿主侧省延迟（v2.2.5/2.2.6，零代码，改用户自己的 `opencode.json`）**：`warming: {"interval": "auto", "duration": "2 hours"}` 让长轮 dev 常驻会话保住 provider 侧 prompt cache（auto=各模型 `cache.ttl` 的 90%，无 ttl 的模型不 warm；注意 warm 请求是真实计费请求，只在长轮开）；`compaction: {"buffer": "20%"}` 给大小模型各留百分比 headroom，dev 跨多任务不断片。v2.6 起 warming 可按 provider/model 分配，细配见官方 warming 文档。
+- **宿主 policy 别误伤**：v2.2.3 起 managed policy 拆成 `mcp.use`/`skill.use`/`plugin.use` 独立动作——配宿主 policy 时别把 `swarm_*` 拦了；这和我们自家门禁（policyGate 看 paths 禁区）是两层，不要混。

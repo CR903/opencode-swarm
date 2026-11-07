@@ -22,6 +22,7 @@ import {
   readRunSnapshot, funnelCounts, sessionRows, healthJudgement, formatElapsed,
   findingsByTask, executorOf, approvalsByTask, pendingApprovals,
   listRunSummaries, sessionRunIndex, resolveFooterRun, shouldShowBoard,
+  nextWave, parseSwarmBlock, formatSwarmDigest, notifyEdge,
 } from '../lib/swarm-board-data.mjs';
 
 let dir;
@@ -524,5 +525,138 @@ describe('sessionRunIndex 健壮性（看板跟随数据源）', () => {
     let idx;
     assert.doesNotThrow(() => { idx = sessionRunIndex(dir); });
     assert.ok(idx['ses_nosess_host'], '已有索引不受脏轮影响');
+  });
+});
+
+describe('nextWave（P0-1：波次过滤循环，tsx 内联逻辑抽纯）', () => {
+  test('空波次回 all', () => {
+    assert.equal(nextWave('all', []), 'all');
+    assert.equal(nextWave('W1', []), 'all');
+  });
+
+  test('all → 首波次', () => {
+    assert.equal(nextWave('all', ['W1', 'W2']), 'W1');
+  });
+
+  test('中间 → 下一波次', () => {
+    assert.equal(nextWave('W1', ['W1', 'W2']), 'W2');
+  });
+
+  test('末尾 → all', () => {
+    assert.equal(nextWave('W2', ['W1', 'W2']), 'all');
+  });
+
+  test('未知当前值 → all（波次改名后不卡死）', () => {
+    assert.equal(nextWave('W9', ['W1', 'W2']), 'all');
+  });
+
+  test('坏输入 → all，永不抛错', () => {
+    assert.equal(nextWave(null, ['W1']), 'all');
+    assert.equal(nextWave('all', null), 'all');
+    assert.equal(nextWave('all', 'W1'), 'all');
+  });
+});
+
+describe('parseSwarmBlock（P0-2：```swarm fence 内容解析）', () => {
+  test('run: X → {run:X}', () => {
+    assert.deepEqual(parseSwarmBlock('run: BR1'), { run: 'BR1' });
+  });
+
+  test('大小写/等号/前后空格容忍', () => {
+    assert.deepEqual(parseSwarmBlock('RUN = br-2'), { run: 'br-2' });
+    assert.deepEqual(parseSwarmBlock('  Run :  中文轮  '), { run: '中文轮' });
+  });
+
+  test('多行取 run 行，其余忽略', () => {
+    assert.deepEqual(parseSwarmBlock('funnel\nrun: R3\nxxx'), { run: 'R3' });
+  });
+
+  test('无 run 行 → {run:null}（=当前轮）', () => {
+    assert.deepEqual(parseSwarmBlock('funnel'), { run: null });
+    assert.deepEqual(parseSwarmBlock(''), { run: null });
+  });
+
+  test('坏输入 → {run:null}，永不抛错', () => {
+    assert.deepEqual(parseSwarmBlock(null), { run: null });
+    assert.deepEqual(parseSwarmBlock(42), { run: null });
+  });
+});
+
+describe('formatSwarmDigest（P0-2：代码块渲染用摘要，纯字串）', () => {
+  const snap = (over = {}) => ({
+    runId: 'R1', ok: true, tasks: [], timeline: [], ...over,
+  });
+
+  test('空轮 → 暂无轮次', () => {
+    assert.match(formatSwarmDigest(snap({ runId: '' })), /暂无轮次/);
+  });
+
+  test('正常轮含 runId + funnel 计数', () => {
+    const s = snap({
+      tasks: [
+        task({ id: 'A', status: 'queued' }),
+        task({ id: 'B', status: 'dev_doing' }),
+        task({ id: 'C', status: 'passed' }),
+      ],
+    });
+    const d = formatSwarmDigest(s);
+    assert.match(d, /R1/);
+    assert.match(d, /Q1/);
+    assert.match(d, /✓1/);
+  });
+
+  test('高风险待批列出 id', () => {
+    const s = snap({ tasks: [task({ id: 'H1', status: 'test_doing', risk: 'high' })] });
+    assert.match(formatSwarmDigest(s), /H1/);
+    assert.match(formatSwarmDigest(s), /待批/);
+  });
+
+  test('断源标 STALE', () => {
+    assert.match(formatSwarmDigest(snap({ ok: false })), /STALE/);
+  });
+
+  test('坏输入不崩', () => {
+    assert.doesNotThrow(() => formatSwarmDigest(null));
+    assert.equal(typeof formatSwarmDigest(undefined), 'string');
+  });
+});
+
+describe('notifyEdge（P0-3：HALT/待批边缘触发，一轮询最多一次）', () => {
+  const sum = (over = {}) => ({ halted: 0, pending: [], ...over });
+
+  test('无→熔断 ⇒ halt（含文案）', () => {
+    const r = notifyEdge(sum(), sum({ halted: 1 }));
+    assert.equal(r?.kind, 'halt');
+    assert.ok(r.message.length > 0);
+  });
+
+  test('熔断持续 ⇒ null（不重复轰炸）', () => {
+    assert.equal(notifyEdge(sum({ halted: 1 }), sum({ halted: 2 })), null);
+  });
+
+  test('熔断恢复 ⇒ null（静默复位，下次可再报）', () => {
+    assert.equal(notifyEdge(sum({ halted: 1 }), sum()), null);
+    assert.equal(notifyEdge(sum(), sum({ halted: 1 }))?.kind, 'halt');
+  });
+
+  test('无→待批默认不开 ⇒ null', () => {
+    assert.equal(notifyEdge(sum(), sum({ pending: ['H1'] })), null);
+  });
+
+  test('pendingEnabled 开 → pending', () => {
+    const r = notifyEdge(sum(), sum({ pending: ['H1'] }), { pendingEnabled: true });
+    assert.equal(r?.kind, 'pending');
+    assert.match(r.message, /H1/);
+  });
+
+  test('同轮双边缘 halt 优先', () => {
+    const r = notifyEdge(sum(), sum({ halted: 1, pending: ['H1'] }), { pendingEnabled: true });
+    assert.equal(r?.kind, 'halt');
+  });
+
+  test('prev 缺失视作空态（首次轮询即见熔断照报），next 缺失回 null', () => {
+    assert.equal(notifyEdge(null, sum({ halted: 1 }))?.kind, 'halt');
+    assert.equal(notifyEdge(sum(), null), null);
+    assert.equal(notifyEdge(null, null), null);
   });
 });
